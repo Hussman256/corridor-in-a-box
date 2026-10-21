@@ -58,6 +58,15 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      # web/ renders corridor data and the state list generated from the
+      # manifests and the engine. Fail when the committed copy has drifted.
+      - name: Check web/lib/generated is up to date
+        run: |
+          pnpm gen:web-data
+          git diff --exit-code web/lib/generated || {
+            echo "::error::web/lib/generated is stale. Run 'pnpm gen:web-data' and commit the result."
+            exit 1
+          }
 
   # Exercises PostgresIdempotencyStore against a real Postgres (the atomic claim
   # + version-guarded upsert that guard against double-settlement). The test is

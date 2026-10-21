@@ -7,6 +7,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Fixed — `web/` reads corridor data and the state list from the repo, not hand copies ([#293](https://github.com/ezedike-evan/corridor-in-a-box/issues/293))
+
+`web/lib/corridors.ts` had hand-copied four of the six manifests and kept its
+own copy of `liveness()`, which still treated every lane as SEP-31. The
+payment runner hand-listed the engine's states.
+
+- `pnpm gen:web-data` (`scripts/gen-web-data.ts`) loads every
+  `corridors/*.corridor.yaml` with `@corridor/manifest` and reads the state
+  machine from `@corridor/engine`. It writes
+  `web/lib/generated/{corridors,states}.json`, which are committed.
+- `web/` imports those files and calls `@corridor/manifest`'s own `liveness()`,
+  so the site now shows all six corridors and reports SEP-6 lanes correctly.
+  Liveness is computed at render time, not generated: proof freshness depends
+  on today's date.
+- `@corridor/engine` exports `ALL_STATES`, and `CorridorState` is derived from it.
+- `tests/web-data.test.ts` and a CI step fail when the generated files are
+  stale.
+
 ### Fixed — `RegistryRouteResolver` checks the protocol the corridor declares, not SEP-31 ([#211](https://github.com/ezedike-evan/corridor-in-a-box/issues/211))
 
 The registry-backed resolver asked every lane the same question — "is this

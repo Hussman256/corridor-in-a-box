@@ -40,6 +40,7 @@
     "registry:staleness": "tsx examples/check-staleness.ts",
     "registry:history": "tsx examples/registry-history.ts",
     "attest": "tsx examples/attest.ts",
+    "gen:web-data": "tsx scripts/gen-web-data.ts",
     "sweep:anchors": "tsx examples/sweep-anchors.ts"
   },
   "dependencies": {

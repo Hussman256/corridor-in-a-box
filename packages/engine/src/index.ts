@@ -7,7 +7,7 @@ export {
   type ExecuteOptions,
   type RunResult,
 } from "./run";
-export { canTransition, isTerminal, TERMINAL, type CorridorState } from "./state";
+export { ALL_STATES, canTransition, isTerminal, TERMINAL, type CorridorState } from "./state";
 export {
   InMemoryIdempotencyStore,
   hasRequestedRefund,
