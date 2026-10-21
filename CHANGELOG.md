@@ -7,6 +7,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Added — `PostgresAuditSink`: a durable, append-only audit trail ([#272](https://github.com/ezedike-evan/corridor-in-a-box/issues/272))
+
+The audit trail used to live only in memory, so the service lost it on every
+restart, even when `DATABASE_URL` gave it Postgres.
+
+- `PostgresAuditSink` in `@corridor/engine` writes one `corridor_audit` row per
+  state transition. A unique key on `(idempotency_key, version, to_state)` makes
+  a retried write a no-op. Route trust, fees and gate checks are kept in a
+  `detail` JSON column.
+- `listAudit(idempotencyKey)` returns a payment's trail, oldest first.
+- `migrate()` creates the table. `examples/run-service.ts` uses the sink
+  whenever `DATABASE_URL` is set.
+- `docs/operations.md` documents a service role with `SELECT`/`INSERT` only on
+  the table. It also documents what happens when an audit write fails: the
+  payment stops before its next step and resumes later, and the missed entry
+  shows up as a gap in `version`.
+- The CI `integration-postgres` job now also runs
+  `tests/integration/audit-pg.test.ts`.
+
 ### Fixed — `RegistryRouteResolver` checks the protocol the corridor declares, not SEP-31 ([#211](https://github.com/ezedike-evan/corridor-in-a-box/issues/211))
 
 The registry-backed resolver asked every lane the same question — "is this

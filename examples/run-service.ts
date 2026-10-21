@@ -55,11 +55,13 @@ import {
 import {
   InMemoryAuditLog,
   InMemoryIdempotencyStore,
+  PostgresAuditSink,
   PostgresIdempotencyStore,
   PrometheusMetrics,
   consoleLogger,
   defaultSep31Gate,
   migrate,
+  type AuditSink,
   type EngineDeps,
   type IdempotencyStore,
 } from "@corridor/engine";
@@ -104,17 +106,29 @@ function loadCorridors(): Map<string, Corridor> {
   return map;
 }
 
-async function buildStore(): Promise<{ store: IdempotencyStore; close: () => Promise<void> }> {
+async function buildStore(): Promise<{
+  store: IdempotencyStore;
+  audit: AuditSink;
+  close: () => Promise<void>;
+}> {
   const dbUrl = process.env.DATABASE_URL;
   if (!dbUrl) {
-    console.log("• idempotency: in-memory (set DATABASE_URL for a durable run)");
-    return { store: new InMemoryIdempotencyStore(), close: async () => {} };
+    console.log("• idempotency + audit: in-memory (set DATABASE_URL for a durable run)");
+    return {
+      store: new InMemoryIdempotencyStore(),
+      audit: new InMemoryAuditLog(),
+      close: async () => {},
+    };
   }
   const { Pool } = await import("pg");
   const pool = new Pool({ connectionString: dbUrl });
   await migrate(pool);
-  console.log("• idempotency: Postgres (migrated)");
-  return { store: new PostgresIdempotencyStore(pool), close: () => pool.end() };
+  console.log("• idempotency + audit: Postgres (migrated)");
+  return {
+    store: new PostgresIdempotencyStore(pool),
+    audit: new PostgresAuditSink(pool),
+    close: () => pool.end(),
+  };
 }
 
 /**
@@ -202,7 +216,7 @@ async function main(): Promise<void> {
   const horizonUrl = env("HORIZON_URL", "https://horizon-testnet.stellar.org");
   const sep10 = new StellarSep10Signer(signer);
   const submitter = new StellarSettlementSubmitter({ signer, horizonUrl });
-  const { store, close } = await buildStore();
+  const { store, audit, close } = await buildStore();
   const metrics = new PrometheusMetrics();
   const adapters = buildAdapterRegistry(sep10);
   validateCorridors(corridors, adapters);
@@ -214,7 +228,7 @@ async function main(): Promise<void> {
     resolver,
     submitter,
     idempotency: store,
-    audit: new InMemoryAuditLog(),
+    audit,
     logger: consoleLogger,
     metrics,
     trustManifestWithoutAttestation: true,

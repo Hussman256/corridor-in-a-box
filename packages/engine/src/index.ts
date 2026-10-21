@@ -38,6 +38,7 @@ export {
   type CorridorHealthStore,
   type RecordOutcomeOptions,
 } from "./breaker";
+export { PostgresAuditSink, CREATE_AUDIT_TABLE_SQL } from "./audit-pg";
 export {
   PostgresCorridorHealthStore,
   CREATE_BREAKERS_TABLE_SQL,
