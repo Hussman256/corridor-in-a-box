@@ -98,7 +98,7 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec vitest run tests/integration/idempotency-pg.test.ts tests/integration/audit-pg.test.ts
+      - run: pnpm exec vitest run --no-file-parallelism tests/integration/idempotency-pg.test.ts tests/integration/audit-pg.test.ts
 
   # The web/ showcase app is a standalone Next.js project with its own lockfile
   # (intentionally outside the pnpm workspace, see web/README.md), so it gets its
