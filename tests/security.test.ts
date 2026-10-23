@@ -6,18 +6,34 @@
 // actually hold" stays visible in one place — every one of these passed the type
 // checker and the old test suite while being wrong.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createService } from "@corridor/service";
 import { createMockAdapter } from "@corridor/adapter-kit";
 import { StaticRouteResolver } from "@corridor/router";
 import { loadCorridor, type Corridor } from "@corridor/manifest";
 import { InMemoryIdempotencyStore, type SettlementRef } from "@corridor/engine";
 import { Sep31Adapter } from "@corridor/sep31";
+import * as corridorTypes from "@corridor/types";
 import { isSettleableAmount, isValidAmount, type Outcome } from "@corridor/types";
 
 const loaded = loadCorridor("corridors/reference.corridor.yaml");
 if (!loaded.ok) throw new Error("fixture manifest failed to load");
-const CORRIDOR: Corridor = loaded.value;
+// The reference manifest is unverified/unproven, which caps payments at the canary
+// amount. These tests exercise service behaviour, not the cap, so mark it proven.
+const CORRIDOR: Corridor = {
+  ...loaded.value,
+  dest: {
+    ...loaded.value.dest,
+    endpoints: { ...loaded.value.dest.endpoints, endpoints_verified_at: "1970-01-01" },
+  } as Corridor["dest"],
+  proof: {
+    canary_completed_at: "1970-01-01T00:00:00Z",
+    stellar_tx_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    anchor_transaction_id: "canary-test",
+    amount: "1",
+    max_age_days: 50000,
+  },
+};
 
 /** A submitter that records what it was asked to send, and always succeeds. */
 function recordingSubmitter() {
@@ -27,7 +43,10 @@ function recordingSubmitter() {
     submitter: {
       async submit(req: { amount: { asset: string; amount: string } }) {
         sent.push(req.amount);
-        return { ok: true as const, value: { stellarTxHash: "hash", ledger: 1 } };
+        return {
+          ok: true as const,
+          value: { kind: "stellar" as const, stellarTxHash: "hash", ledger: 1 },
+        };
       },
       async refund(): Promise<Outcome<SettlementRef>> {
         return {
@@ -42,13 +61,17 @@ function recordingSubmitter() {
 function service(opts: {
   apiKeys?: Set<string>;
   rateLimit?: { capacity: number; refillPerSec: number };
+  rateLimiter?: { take(key: string): boolean | Promise<boolean> };
   store?: InMemoryIdempotencyStore;
   submitter?: ReturnType<typeof recordingSubmitter>["submitter"];
+  now?: () => number;
 }) {
   return createService({
     corridors: new Map([[CORRIDOR.id, CORRIDOR]]),
     apiKeys: opts.apiKeys,
     rateLimit: opts.rateLimit,
+    rateLimiter: opts.rateLimiter,
+    now: opts.now,
     deps: {
       resolver: new StaticRouteResolver(() => createMockAdapter(), {
         trustManifestWithoutAttestation: true,
@@ -56,6 +79,7 @@ function service(opts: {
       idempotency: opts.store ?? new InMemoryIdempotencyStore(),
       submitter: opts.submitter ?? recordingSubmitter().submitter,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     },
   });
 }
@@ -141,6 +165,17 @@ describe("run ownership (IDOR)", () => {
     expect(JSON.stringify(asBob.body)).not.toContain("hash");
   });
 
+  it("continues to accept legacy Set<string> API keys", async () => {
+    const svc = service({ apiKeys: new Set(["legacy-key"]) });
+    const response = await svc.route({
+      method: "GET",
+      path: "/payments/missing",
+      headers: { authorization: "Bearer legacy-key" },
+    });
+    // Authentication succeeded; the requested run simply does not exist.
+    expect(response.status).toBe(404);
+  });
+
   it("never returns the raw lastError message to a caller", async () => {
     const store = new InMemoryIdempotencyStore();
     await store.create({
@@ -166,6 +201,51 @@ describe("run ownership (IDOR)", () => {
 });
 
 describe("rate limiting", () => {
+  it("compares every configured secret using constantTimeEqual", async () => {
+    const comparisons: string[] = [];
+    const constantTimeEqual = corridorTypes.constantTimeEqual;
+    const compareSpy = vi
+      .spyOn(corridorTypes, "constantTimeEqual")
+      .mockImplementation((candidate, presented) => {
+        comparisons.push(candidate);
+        return constantTimeEqual(candidate, presented);
+      });
+    try {
+      const svc = service({
+        apiKeys: new Set(["before", "matched", "after"]),
+        rateLimit: { capacity: 10, refillPerSec: 1 },
+      });
+      const response = await svc.route({
+        method: "GET",
+        path: "/payments/missing",
+        headers: { authorization: "Bearer matched" },
+      });
+      expect(response.status).toBe(404);
+      // Matching occurs once for limiter identity and once for authentication.
+      // Each pass must compare every configured candidate, including after a match.
+      expect(comparisons).toEqual([
+        "before",
+        "matched",
+        "after",
+        "before",
+        "matched",
+        "after",
+      ]);
+    } finally {
+      compareSpy.mockRestore();
+    }
+  });
+
+  it("returns 401 for an invalid bearer credential", async () => {
+    const svc = service({ apiKeys: new Set(["configured-key"]) });
+    const response = await svc.route({
+      method: "GET",
+      path: "/payments/missing",
+      headers: { authorization: "Bearer invalid-key" },
+    });
+    expect(response.status).toBe(401);
+  });
+
   // The 401 used to return BEFORE the limiter, so wrong keys cost the attacker
   // nothing and could be tried at line rate.
   it("rate-limits failed authentication attempts", async () => {
@@ -348,7 +428,12 @@ describe("SEP-38 quotes", () => {
       expires_at: new Date(Date.now() + 60_000).toISOString(),
       sell_amount: "10",
       buy_amount: "8.57",
-      fee: { total: "1.00", asset: "stellar:USDC:GBBD47IF" },
+      // A real SEP-38 server reports the fee in the asset it was asked to sell: the full
+      // `stellar:CODE:ISSUER` id, issuer included.
+      fee: {
+        total: "1.00",
+        asset: `stellar:${CORRIDOR.settlement.bridge_asset}:${CORRIDOR.settlement.asset_issuer}`,
+      },
       ...over,
     });
 

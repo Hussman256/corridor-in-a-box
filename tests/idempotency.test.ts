@@ -26,12 +26,20 @@ function corridor(): Corridor {
       endpoints: {
         home_domain: "d.example",
         transfer_server_sep31: "https://d.example/sep31",
+        endpoints_verified_at: "1970-01-01",
       },
     },
     fx: { path: ["ARS", "USDC", "ARS"], who_holds_risk: "receiving_anchor" },
     compliance: { source_jurisdiction: "AR", dest_jurisdiction: "AR" },
     settlement: { network: "public", asset_issuer: "GISSUER" },
     recovery: {},
+    proof: {
+      canary_completed_at: "1970-01-01T00:00:00Z",
+      stellar_tx_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      anchor_transaction_id: "canary-test",
+      amount: "1",
+      max_age_days: 50000,
+    },
   });
   if (!r.ok) throw new Error("fixture invalid");
   return r.value;
@@ -54,6 +62,7 @@ function deps(store: InMemoryIdempotencyStore): EngineDeps {
     idempotency: store,
     sleep: async () => {},
     trustManifestWithoutAttestation: true,
+    unsafeSkipPreSettleGate: true,
   };
 }
 
@@ -115,6 +124,7 @@ describe("concurrent claim", () => {
       idempotency: store,
       sleep: async () => {},
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
 
     const [a, b] = await Promise.all([
@@ -127,6 +137,51 @@ describe("concurrent claim", () => {
     const loser = outcomes.find((r) => !r.ok);
     expect(loser && !loser.ok && loser.error.code).toBe("IDEMPOTENCY_CONFLICT");
     expect(settlements).toBe(1);
+  });
+});
+
+describe("held run resolution", () => {
+  it("lists only held runs with limits and corridor filtering", async () => {
+    const store = new InMemoryIdempotencyStore();
+    await store.put({ idempotencyKey: "held-a", corridorId: "a", state: "held", version: 4 });
+    await store.put({ idempotencyKey: "held-b", corridorId: "b", state: "held", version: 2 });
+    await store.put({
+      idempotencyKey: "done",
+      corridorId: "a",
+      state: "completed",
+      version: 8,
+    });
+
+    expect(await store.listByState("held", { corridorId: "a" })).toMatchObject([
+      { idempotencyKey: "held-a", state: "held" },
+    ]);
+    expect(await store.listByState("held", { limit: 1 })).toHaveLength(1);
+  });
+
+  it("records one append-only resolution for a held run only", async () => {
+    const store = new InMemoryIdempotencyStore();
+    await store.put({ idempotencyKey: "held", corridorId: "a", state: "held", version: 4 });
+    await store.put({
+      idempotencyKey: "done",
+      corridorId: "a",
+      state: "completed",
+      version: 8,
+    });
+    const resolution = {
+      idempotencyKey: "held",
+      outcome: "refunded-offchain" as const,
+      note: "Operations confirmed bank refund",
+      resolvedBy: "operator-1",
+      resolvedAt: 1700000000000,
+    };
+
+    expect(await store.recordResolution(resolution)).toBe(true);
+    expect(await store.recordResolution(resolution)).toBe(false);
+    expect(await store.recordResolution({ ...resolution, idempotencyKey: "done" })).toBe(
+      false,
+    );
+    expect(await store.getResolution("held")).toEqual(resolution);
+    expect((await store.get("held"))?.state).toBe("held");
   });
 });
 
@@ -172,10 +227,20 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
         version: params[3] as number,
         transaction_id: params[4],
         quote_id: params[5],
-        stellar_tx_hash: params[6],
-        refund_id: params[7],
-        last_error: params[8],
-        owner: params[9],
+        quote_expires_at: params[6],
+        quote_firm: params[7],
+        settlement_amount: params[8],
+        stellar_tx_hash: params[9],
+        settlement_kind: params[10],
+        settlement_ref: params[11],
+        deposit_address: params[12],
+        memo: params[13],
+        memo_type: params[14],
+        refund_id: params[15],
+        last_error: params[16],
+        owner: params[17],
+        settlement: params[18],
+        manifest_hash: params[19],
       };
       // create(): INSERT … ON CONFLICT DO NOTHING RETURNING — only the first
       // writer for a key lands a row and gets it back; a conflict returns [].
@@ -191,7 +256,10 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
       if (!current || (current.version as number) < incoming.version) {
         table.set(key, {
           ...incoming,
+          settlement_kind: incoming.settlement_kind ?? current?.settlement_kind,
+          settlement_ref: incoming.settlement_ref ?? current?.settlement_ref,
           refund_id: current?.refund_id ?? incoming.refund_id,
+          manifest_hash: current?.manifest_hash ?? incoming.manifest_hash,
         });
       }
       return { rows: [] as R[] };
@@ -313,11 +381,94 @@ describe("refund state round-trips", () => {
       },
     });
     expect(seen[0]).toContain("refund_id");
+    expect(
+      seen.some((sql) => sql.includes("create table if not exists corridor_resolutions")),
+    ).toBe(true);
     expect(seen.slice(1).join("\n")).toContain("add column if not exists refund_id");
+    expect(seen[0]).toContain("deposit_address");
+    expect(seen[0]).toContain("memo");
+    expect(seen[0]).toContain("memo_type");
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists deposit_address");
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists memo");
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists memo_type");
+  });
+
+  it("ships resume data columns in create DDL and additive migrations", async () => {
+    const seen: string[] = [];
+    await migrate({
+      async query(text: string) {
+        seen.push(text);
+        return { rows: [] };
+      },
+    });
+    for (const column of [
+      "quote_expires_at",
+      "quote_firm",
+      "settlement_amount",
+      "deposit_address",
+      "manifest_hash",
+      "settlement_kind",
+      "settlement_ref",
+    ]) {
+      expect(seen[0]).toContain(column);
+      expect(seen.slice(1).join("\n")).toContain(`add column if not exists ${column}`);
+    }
   });
 });
 
 describe("PostgresIdempotencyStore", () => {
+  it("queries held runs with parameterized filters and bounded limits", async () => {
+    let captured = { text: "", params: [] as unknown[] };
+    const db: Queryable = {
+      async query(text, params = []) {
+        captured = { text, params };
+        return {
+          rows: [
+            {
+              idempotency_key: "held-1",
+              corridor_id: "corridor-a",
+              state: "held",
+              version: 4,
+              transaction_id: null,
+              quote_id: null,
+              stellar_tx_hash: "tx-hash",
+              refund_id: null,
+              last_error: "needs operator",
+              owner: null,
+            },
+          ] as never,
+        };
+      },
+    };
+    const store = new PostgresIdempotencyStore(db);
+    const runs = await store.listByState("held", { corridorId: "corridor-a", limit: 20 });
+    expect(captured.text).toContain("where state = $1 and corridor_id = $2");
+    expect(captured.text).toContain("limit $3");
+    expect(captured.params).toEqual(["held", "corridor-a", 20]);
+    expect(runs[0]).toMatchObject({ idempotencyKey: "held-1", stellarTxHash: "tx-hash" });
+  });
+
+  it("inserts out-of-band resolutions only when the run is held", async () => {
+    let captured = "";
+    const db: Queryable = {
+      async query(text) {
+        captured = text;
+        return { rows: [{ idempotency_key: "held-1" }] as never };
+      },
+    };
+    const store = new PostgresIdempotencyStore(db);
+    const inserted = await store.recordResolution({
+      idempotencyKey: "held-1",
+      outcome: "written-off",
+      note: "approved",
+      resolvedBy: "operator",
+      resolvedAt: 1_700_000_000_000,
+    });
+    expect(inserted).toBe(true);
+    expect(captured).toContain("state = 'held'");
+    expect(captured).toContain("on conflict (idempotency_key) do nothing");
+  });
+
   it("round-trips a run and maps null columns to undefined", async () => {
     const db = fakeDb();
     const store = new PostgresIdempotencyStore(db);
@@ -333,6 +484,55 @@ describe("PostgresIdempotencyStore", () => {
     expect(got).toMatchObject({ idempotencyKey: "k", state: "settled", transactionId: "tx" });
     expect(got?.stellarTxHash).toBeUndefined();
     expect(got?.quoteId).toBeUndefined();
+    expect(got?.depositAddress).toBeUndefined();
+    expect(got?.memo).toBeUndefined();
+    expect(got?.memoType).toBeUndefined();
+  });
+
+  it("round-trips depositAddress, memo, and memoType", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    const run: StoredRun = {
+      idempotencyKey: "k-dep",
+      corridorId: "c",
+      state: "opened",
+      version: 3,
+      transactionId: "tx-dep",
+      depositAddress: "GDEP123",
+      memo: "memo-test",
+      memoType: "text",
+    };
+    await store.put(run);
+    const got = await store.get("k-dep");
+    expect(got?.depositAddress).toBe("GDEP123");
+    expect(got?.memo).toBe("memo-test");
+    expect(got?.memoType).toBe("text");
+  });
+
+  it("round-trips quote and opened transaction data", async () => {
+    const store = new PostgresIdempotencyStore(fakeDb());
+    await store.put({
+      idempotencyKey: "resume-data",
+      corridorId: "c",
+      state: "opened",
+      version: 2,
+      transactionId: "tx",
+      quoteId: "quote",
+      quoteExpiresAt: 1234,
+      quoteFirm: true,
+      settlementAmount: "10.00",
+      depositAddress: "GDEST",
+      memo: "memo",
+      memoType: "hash",
+    });
+    expect(await store.get("resume-data")).toMatchObject({
+      quoteExpiresAt: 1234,
+      quoteFirm: true,
+      settlementAmount: "10.00",
+      depositAddress: "GDEST",
+      memo: "memo",
+      memoType: "hash",
+    });
   });
 
   it("ignores a stale write with a lower version (optimistic concurrency)", async () => {
@@ -343,5 +543,98 @@ describe("PostgresIdempotencyStore", () => {
     const got = await store.get("k");
     expect(got?.state).toBe("reconciled");
     expect(got?.version).toBe(6);
+  });
+
+  it("round-trips manifestHash", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    const run: StoredRun = {
+      idempotencyKey: "k-hash",
+      corridorId: "c",
+      state: "opened",
+      version: 1,
+      manifestHash: "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+    };
+    await store.create(run);
+    const got = await store.get("k-hash");
+    expect(got?.manifestHash).toBe(
+      "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+    );
+  });
+
+  it("round-trips settlementKind and settlementRef for both adapter and stellar", async () => {
+    const memoryStore = new InMemoryIdempotencyStore();
+    const db = fakeDb();
+    const pgStore = new PostgresIdempotencyStore(db);
+
+    for (const store of [memoryStore, pgStore]) {
+      // Adapter settlement
+      await store.put({
+        idempotencyKey: "run-adapter",
+        corridorId: "c",
+        state: "settled",
+        version: 2,
+        settlementKind: "adapter",
+        settlementRef: {
+          kind: "adapter",
+          reference: "otc_998877",
+          reportedAt: 1700000000000,
+        },
+      });
+      const adapterRun = await store.get("run-adapter");
+      expect(adapterRun?.settlementKind).toBe("adapter");
+      expect(adapterRun?.settlementRef).toEqual({
+        kind: "adapter",
+        reference: "otc_998877",
+        reportedAt: 1700000000000,
+      });
+      expect(adapterRun?.stellarTxHash).toBeUndefined();
+
+      // Stellar settlement
+      await store.put({
+        idempotencyKey: "run-stellar",
+        corridorId: "c",
+        state: "settled",
+        version: 2,
+        stellarTxHash: "tx_hash_stellar_123",
+        settlementKind: "stellar",
+        settlementRef: {
+          kind: "stellar",
+          stellarTxHash: "tx_hash_stellar_123",
+          ledger: 54321,
+        },
+      });
+      const stellarRun = await store.get("run-stellar");
+      expect(stellarRun?.settlementKind).toBe("stellar");
+      expect(stellarRun?.stellarTxHash).toBe("tx_hash_stellar_123");
+      expect(stellarRun?.settlementRef).toEqual({
+        kind: "stellar",
+        stellarTxHash: "tx_hash_stellar_123",
+        ledger: 54321,
+      });
+    }
+  });
+
+  it("maps legacy Postgres row with only stellar_tx_hash to stellar SettlementRef", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    // Simulate pre-existing row in database with no settlement_kind or settlement_ref columns
+    db.table.set("legacy-row", {
+      idempotency_key: "legacy-row",
+      corridor_id: "c",
+      state: "settled",
+      version: 1,
+      stellar_tx_hash: "old_stellar_tx_hash",
+      settlement_kind: null,
+      settlement_ref: null,
+    });
+
+    const run = await store.get("legacy-row");
+    expect(run?.stellarTxHash).toBe("old_stellar_tx_hash");
+    expect(run?.settlementKind).toBe("stellar");
+    expect(run?.settlementRef).toEqual({
+      kind: "stellar",
+      stellarTxHash: "old_stellar_tx_hash",
+    });
   });
 });

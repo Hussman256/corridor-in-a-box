@@ -11,6 +11,33 @@ running migrations, and the project's versioning/release policy.
 > Treat this runbook as the plan for a self-run testnet/close-beta pilot, not a
 > claim of production-readiness.
 
+## 0. Adding an anchor to the fleet
+
+`contracts/anchors.json` is the fleet's curated list of anchors. It is **not**
+seeded automatically from the Stellar Anchor Directory (anchors.stellar.org):
+the directory is a human-facing web app with no documented machine-readable
+feed, so every entry is a deliberate, reviewed addition. Never invent a domain —
+every entry must come from the directory or the anchor's own site.
+
+To add an anchor:
+
+1. Find it on [anchors.stellar.org](https://anchors.stellar.org) and open its
+   `stellar.toml` (`https://<home-domain>/.well-known/stellar.toml`).
+2. Record the home domain, the countries and currencies it serves, and the SEPs
+   it claims (`TRANSFER_SERVER_SEP0031`, `ANCHOR_QUOTE_SERVER`, `KYC_SERVER`,
+   `WEB_AUTH_ENDPOINT`).
+3. Add a structured entry to `contracts/anchors.json` with those fields and a
+   `$comment` noting where the data came from and when it was checked.
+4. Run `pnpm test` — the validation test rejects malformed or duplicate entries.
+5. Open a PR. A human reviews the diff; nothing writes the file automatically.
+
+Spell the domain in its canonical form: lowercase letters, digits, dots, and
+hyphens inside a label only — no scheme, no port, no path, no leading or
+trailing `.` or `-`. `contracts/attester` refuses anything else with
+`Error::InvalidDomain`, and `pnpm attest` refuses it before paying for a
+simulation, because the registry keys records by the raw string: `Cowrie.Exchange`
+alongside `cowrie.exchange` is one anchor with two permanent records.
+
 ## 1. Capturing the testnet end-to-end run
 
 Endpoints of one production anchor were probed live, and the full money-moving
@@ -37,8 +64,49 @@ run is automated by `pnpm verify:corridor` and the `reference-corridor` workflow
    ANCHOR_SEP31_WEB_AUTH=… CORRIDOR_SIGNER_SECRET=S… \
    pnpm exec vitest run tests/integration/sep31-live.test.ts
    ```
-4. **Pre-flight the manifest** offline: `pnpm cli plan corridors/reference.corridor.yaml`
-   must report the lane runnable (no liveness warnings).
+4. **Pre-flight the manifest** offline:
+
+   ```bash
+   pnpm cli plan corridors/reference.corridor.yaml
+   ```
+
+   Expected output (abridged):
+
+   ```
+   liveness: ? UNVERIFIED — endpoints present but unconfirmed. NOT runnable.
+
+   liveness warnings:
+     ! dest endpoints are UNVERIFIED — the URLs below have never been confirmed against …
+   ```
+
+   `UNVERIFIED` is the correct and expected result for the reference corridor.
+   `corridors/reference.corridor.yaml` points at `localhost` and deliberately has no
+   `endpoints_verified_at` — setting that field on a localhost manifest would be
+   meaningless. The warning about unconfirmed endpoints is the proof that the
+   manifest is honest, not broken.
+
+   What the pre-flight check is actually verifying here:
+
+   - The manifest parses and validates (exit 0).
+   - The liveness state is **not** `NOT RUNNABLE` — every required endpoint field
+     (`transfer_server_sep31`, `quote_server`, `kyc_server`) is present. A
+     `NOT RUNNABLE` result or a "quotes will fail / no per-customer KYC" warning
+     means the manifest has a structural gap that will break the run.
+   - The output is **not** `✓ VERIFIED` — a localhost manifest that somehow
+     reported verified would be the lie to catch.
+
+   The live readiness check — are the containers up, is SEP-31 receiving, is the
+   observer cursor in range — is `scripts/reference-anchor.sh doctor` (step 2 above,
+   or run it again here):
+
+   ```bash
+   scripts/reference-anchor.sh doctor
+   ```
+
+   That command exits non-zero and names the failing check, so it can gate CI.
+   Run it after `up` and before driving a payment; `plan` cannot replace it for a
+   self-hosted stack.
+
 5. **Drive one payment** with the real implementations wired per the README's
    "Going live" list (`Sep31Adapter` + `StellarSettlementSubmitter` +
    `PostgresIdempotencyStore`, with an `audit` sink). Capture the resulting
@@ -64,10 +132,19 @@ scripts/reference-anchor.sh down           # tear it all down
 
 #### `doctor` - check before you run, not after
 
-A corridor run against a sick stack does not fail fast. It reaches `settled`,
-polls for the whole of `recovery.timeout_seconds` (900s by default) and then
-fails with `SETTLEMENT_TIMEOUT`. Every one of those minutes was spent learning
-something that was knowable beforehand. Run `doctor` first:
+A corridor run against a sick stack does not fail fast. It reaches `settled`
+and polls while waiting for the anchor to reconcile. If the anchor reports
+unchanged statuses for the configured stall window, the engine stops early
+with `RECONCILE_STALLED`—around 20 seconds by default. If statuses continue
+changing but never reach a terminal state, polling continues until
+`recovery.timeout_seconds` expires (900s by default), then fails with
+`SETTLEMENT_TIMEOUT`.
+
+A corridor can tune its reconciliation patience with
+`recovery.reconcile: { poll_seconds, stall_polls }`; unset fields fall back to
+`EngineDeps.reconcilePollMs` / `stallThreshold`, then 2s / 10 polls. In either
+case, time spent waiting on a sick stack was spent learning something that was
+knowable beforehand. Run `doctor` first:
 
 ```
 reference anchor doctor
@@ -90,18 +167,17 @@ or a `verify:corridor` run:
 ```
 
 The lag is reported as a **number of ledgers**, not a yes/no, because the
-interesting cases are the borderline ones. The default limit of 180 ledgers is
-the default `recovery.timeout_seconds` (900s) at testnet's ~5s close time: an
-observer further back than that cannot catch up to a fresh payment before the
-engine stops waiting for it. Set `CURSOR_LAG_FAIL_LEDGERS` if your corridor's
-timeout differs.
+interesting cases are the borderline ones. The default limit of 180 ledgers
+was originally based on a 900s timeout, but with stall detection the practical
+window is now ~20s: the cursor must be near the tip to catch a fresh payment
+before the engine stops waiting. Set `CURSOR_LAG_FAIL_LEDGERS` to adjust the limit.
 
 #### The observer cursor
 
 The one failure that will waste an afternoon: the platform's Stellar observer
 resumes from a **stale cursor**, never matches the payment your settle leg just
 made, and leaves the transaction at `pending_sender` until the engine reports
-`SETTLEMENT_TIMEOUT`. That looks like an engine bug and is not one.
+`RECONCILE_STALLED`. That looks like an engine bug and is not one.
 
 The cursor is not a config value — Anchor Platform keeps it in the platform DB
 (`stellar_payment_observer_page_token`, one row keyed `SINGLETON_ID`) and only
@@ -141,7 +217,7 @@ exits non-zero unless the terminal state is `completed`. It prints the trail on
 both paths — the failing run is the one worth reading:
 
 ```
-trail: created -> quoted -> compliant -> opened -> settling -> retrying -> settling -> recovering -> refunded
+trail: created -> quoted -> compliant -> opened -> verifying -> settling -> retrying -> verifying -> settling -> recovering -> refunded
 
 ✗ SETTLEMENT_FAILED — settlement submit failed: tx_failed operations=[op_src_no_trust]
   terminal state: refunded
@@ -161,6 +237,98 @@ XLM; this one settles the asset the anchor actually quotes.
 `GET /rate` throw `Buy amount must be greater than zero`, which surfaces as
 `QUOTE_UNAVAILABLE: quote HTTP 502`. `AMOUNT=1.00` reproduces it; the default of
 `10.00` does not.
+
+### `corridor canary --write` — recording the proof it earns
+
+```bash
+CORRIDOR_SIGNER_SECRET=S… pnpm cli canary corridors/ng-cowrie.corridor.yaml \
+  --amount 1.00 --write
+```
+
+`verify:corridor` above is a PASS/FAIL gate. The canary is the other thing you
+actually want on a lane: it runs one real payment and records **chain-verified
+evidence** in the manifest, which promotes the lane from `VERIFIED` to `PROVEN`.
+
+Three rules make the evidence worth something:
+
+1. **Only `completed` writes.** A run that ends `failed`, `held` or `refunded`
+   leaves the file byte-identical — no partial edit, no stale proof.
+2. **The proof is chain-read, not engine-asserted.** Before touching the
+   manifest, `AccountInspector.settlementFacts()` re-reads the transaction from Horizon and checks
+   the destination, amount, asset and memo against what the engine actually got
+   confirmed. A mismatch refuses the write.
+3. **Comments survive.** The manifest is edited through the `yaml` Document API,
+   so every hand-written explanation in the file is still there afterwards.
+
+The recorded block:
+
+```yaml
+proof:
+  canary_completed_at: "2026-09-27"
+  stellar_tx_hash: 9f2c… # the settlement leg, not the anchor's own id
+  anchor_transaction_id: 7b1e… # the SEP-31 transaction
+  amount: "1.00"
+  max_age_days: 30
+  canary_max_amount: "1.00" # the ceiling future canaries must respect
+```
+
+`canary_max_amount` is a guard rail, not a suggestion: a canary above the
+recorded ceiling is refused outright, and until a lane records one the ceiling
+is `10.00`. `--network public` is required to canary a `network: public`
+corridor, and past `max_age_days` the lane drops back to `VERIFIED` with a
+staleness warning instead of quietly staying green.
+
+### `corridor canary` — single real payment canary CLI command
+
+```bash
+scripts/reference-anchor.sh up
+CORRIDOR_SIGNER_SECRET=S… corridor canary <file.corridor.yaml> --amount 10.00 [--network public]
+```
+
+Drives one full, gated payment through the real stack (`Sep31Adapter`,
+`StellarSettlementSubmitter`, pre-settle gate, `RegistryRouteResolver`) and reports
+whether it reached `completed`.
+
+**Safety guards:**
+
+- **Canary cap**: Amount must not exceed `proof.canary_max_amount` in the corridor manifest (defaults to `10.00` if unspecified).
+- **Liveness requirement**: Corridor liveness must be at least `verified` (refuses `unverified` corridors).
+- **Mainnet guard**: Running against mainnet manifests requires `--network public` to be passed explicitly.
+- **Pre-settle gate**: `balanceCheck` gate validates sender balance and trustlines before funds move on-chain.
+
+**Exit codes** mirror `verify:corridor`:
+
+- `0`: OK (`completed` reached)
+- `1`: Manifest parse/validation error
+- `2`: Missing arguments or missing `CORRIDOR_SIGNER_SECRET`
+- `3`: Refused (mainnet without `--network public`, over canary cap, or unverified liveness)
+- `4`: Stack unfit (`doctor` check failed)
+- `5`: Not completed (payment failed or did not reach `completed`)
+
+### `corridor canary --dry-run` — everything up to the gate, no payment
+
+```bash
+CORRIDOR_SIGNER_SECRET=S… corridor canary <file.corridor.yaml> --amount 1.00 --dry-run
+```
+
+Runs SEP-10 auth, the SEP-38 quote, SEP-12 KYC, the SEP-31 open and every
+pre-settle gate check against the real anchor, then stops before `settling`.
+`SettlementSubmitter.submit()` is never called, so no money moves. The same
+switch is `execute(intent, corridor, deps, { dryRun: true })` in code and
+`--dry-run` on `pnpm example` / `pnpm testnet`.
+
+- A dry run that passes the gate ends in `failed` with `DRY_RUN_COMPLETE` and
+  exits `0`. Its gate results are on the `verifying` and `failed` audit entries.
+  A gate refusal ends with that check's `PRESETTLE_*` code and exits `5`, as a
+  real run would.
+- `DRY_RUN_COMPLETE` is not a lane failure: it never counts toward the circuit
+  breaker.
+- The idempotency key is spent. Use a new key for the real payment.
+- The receiving anchor is left holding an opened SEP-31 transaction that is
+  never funded. Nothing needs cleaning up on our side: the anchor expires it
+  under its own policy. Expect it to appear in the anchor's dashboard as
+  `pending_sender` until then.
+- `--dry-run` cannot be combined with `--write`: a dry run earns no proof.
 
 ## 2. Recovering a stuck payment
 
@@ -220,6 +388,15 @@ blocked on information (usually a SEP-12 customer record or a
 owes the information, not the anchor's throughput. Any other status — including
 one the engine has never seen — means the anchor was working on it.
 
+#### Stalled, not slow
+
+If the run stops with `RECONCILE_STALLED` (mapped to HTTP 504 by the service),
+the engine saw ~20 seconds of identical statuses from the anchor and aborted. The
+message contains the status it was stuck at (e.g., `tx … stuck at status=pending_sender for 10 consecutive polls`).
+This failure is non-retryable. If `stellar_tx_hash` is set on the run, the bridge
+payment did go out to the anchor. Check the anchor's observer logs and its SEP-31
+status history for the transaction to see why it never progressed.
+
 ### `refunded`
 
 **The engine believes no on-chain payment went out.** Despite the name, nothing
@@ -243,11 +420,11 @@ the chain. Verify the belief before closing the run:
   payments (the same check "Crash mid-flight" below prescribes for `settling`)
   before declaring the sender whole.
 
-If an anchor-driven refund path ever lands (a refund-wait state between
-`recovering` and `refunded`), a second, legitimate way into this state appears —
-one where a payment **did** go out and the anchor returned it, hash set. The
-run's trail tells the two apart — and `refund_id`, described below, records
-which refund it was.
+The state machine defines `refund_pending` (between `recovering` and `refunded`)
+but no transition enters it yet — the engine does not call `requestRefund`. When
+a producer lands, a payment that did go out and was returned by the anchor will
+enter `refund_pending` with `stellar_tx_hash` set. The run's trail tells the
+two apart — and `refund_id`, described below, records which refund it was.
 
 ### `refund_id` on the run
 
@@ -271,12 +448,77 @@ anything by hand.
 No payment went out (failure was at quote/comply/open). Safe to retry with a
 **new** `idempotencyKey`.
 
+When the failure carries a `PRESETTLE_*` code, the pre-settle gate refused the
+attempt before the native payment operation was submitted. Resolve the cause,
+then retry with a new key. Never bypass a failed gate by calling the submitter
+directly.
+
+A `failed` run with `DRY_RUN_COMPLETE` is not an incident: it was started with
+`dryRun: true`, passed the gate, and stopped before settling as asked (see
+`corridor canary --dry-run` above).
+
+| Code                              | Meaning                                                             | Operator action                                                                  |
+| --------------------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `PRESETTLE_ANCHOR_DRIFT`          | Live `/info` or `stellar.toml` no longer matches what was verified. | Re-verify the anchor and update the manifest before retrying.                    |
+| `PRESETTLE_TX_MISMATCH`           | The opened anchor transaction is not what is about to be paid.      | Do not pay; open a new transaction and investigate the anchor response.          |
+| `PRESETTLE_DESTINATION_UNSAFE`    | Destination missing, has no trustline, or is not authorized.        | Confirm the destination account and its trustline/authorization with the anchor. |
+| `PRESETTLE_INSUFFICIENT_FUNDS`    | Amount, fee, and reserve do not fit the distribution account.       | Fund the account, establish the bridge-asset trustline, or lower the amount.     |
+| `PRESETTLE_QUOTE_WINDOW`          | The firm quote will not survive settle + confirm.                   | Request a fresh quote and retry promptly.                                        |
+| `PRESETTLE_AMOUNT_OUT_OF_RANGE`   | Amount is outside the anchor or manifest min/max.                   | Adjust the amount to the advertised limits.                                      |
+| `PRESETTLE_RECEIVER_NOT_ACCEPTED` | The receiver's SEP-12 status is no longer `ACCEPTED`.               | Complete or refresh the receiver's KYC before retrying.                          |
+| `CORRIDOR_UNPROVEN`               | Amount is above the canary cap on a lane that is not yet `PROVEN`.  | Stay within the canary cap until the lane is proven.                             |
+
+### `refund_pending`
+
+After a payment has settled but the receiving anchor reports a terminal failure,
+the engine enters `recovering → refund_pending`. The receiving anchor owns the
+refund under SEP-31, so the engine polls `GET /transactions/:id` and does not
+attempt a second on-chain reversal. A full `RefundInfo` report moves the run to
+`refunded` and records the first refund payment id in write-once `refund_id`.
+Partial or unknown refunds, and a silent anchor after
+`recovery.refund_wait_seconds`, move to `held`; the run's `lastError` includes
+the reported `amountRefunded` and `amountFee` when available. Contact the
+anchor and resolve the held run out of band.
+
+### `CORRIDOR_HALTED` and breaker reset
+
+A corridor breaker protects a lane after repeated operational failures. New
+payments are refused with `CORRIDOR_HALTED` until an operator verifies the
+anchor, signer balance, and outstanding runs. Inspect the breaker and reset it
+only after the cause is understood:
+
+```bash
+corridor breaker status [corridor-id]
+corridor breaker reset <corridor-id> --reason "anchor healthy; balance restored"
+```
+
+The reset reason is part of the operator audit record. A reset is not a retry of
+any existing idempotency key; held and failed runs remain unchanged.
+
+### Resolving a held run
+
+List held runs, contact the anchor or recipient, and record the out-of-band
+outcome without mutating the payment state:
+
+```bash
+corridor runs list --state held
+corridor runs resolve <idempotency-key> \
+  --outcome refunded-offchain \
+  --note "anchor refund reference rf_…"
+```
+
+Valid outcomes are `refunded-offchain`, `paid-out-manually`, and `written-off`.
+The command refuses non-held runs and duplicate resolutions; `held` remains the
+immutable payment audit state.
+
 ### Crash mid-flight
 
 On restart, calling `execute()` again with the same intent auto-resumes from
-`settled`/`reconciled` (re-polls, never re-settles). A run stuck in `settling`
-returns `IDEMPOTENCY_CONFLICT` — investigate whether the payment went out (check
-Horizon for the distribution account) before forcing any action.
+`settled`/`reconciled` (re-polls, never re-settles). A run in
+`refund_pending` resumes its refund watch; it never calls the settle leg again.
+A run stuck in `settling` returns `IDEMPOTENCY_CONFLICT` — investigate whether
+the payment went out (check Horizon for the distribution account) before
+forcing any action.
 
 ## 3. Signing-key rotation
 
@@ -294,16 +536,21 @@ The distribution account's seed is the highest-value secret; see
 
 ## 4. Database migrations
 
-The durable store needs one table. Run the bundled DDL once at startup or via
-your migration tool:
+The durable store needs two tables: `corridor_runs` (idempotency) and, if you
+adopt the circuit breaker (§7), `corridor_breakers`. Run the bundled DDL once at
+startup or via your migration tool:
 
 ```ts
 import { migrate } from "@corridor/engine";
-await migrate(pool); // idempotent: CREATE TABLE IF NOT EXISTS corridor_runs (…)
+// idempotent: CREATE TABLE IF NOT EXISTS corridor_runs (…), corridor_breakers (…)
+await migrate(pool);
 ```
 
-The schema is intentionally tiny (`packages/engine/src/idempotency-pg.ts`). The
-`version` column carries optimistic concurrency — never edit it by hand. Any
+`migrate()` is the only migration entry point, so one command brings a database
+up to date — a deployment that upgrades the engine and does not re-run it would
+fail every payment on a missing table. The schema is intentionally tiny
+(`packages/engine/src/idempotency-pg.ts`, `packages/engine/src/breaker-pg.ts`).
+The `version` column carries optimistic concurrency — never edit it by hand. Any
 future schema change ships as an additive migration with a CHANGELOG entry.
 
 ## 5. Scaling notes (before multi-replica)
@@ -365,8 +612,120 @@ terminal counter — they catch money that stopped needing a human (see §2):
 # A payment failed terminally (before or after settle).
 - alert: CorridorPaymentsFailed
   expr: increase(corridor_terminal{state="failed"}[15m]) > 0
+# A lane is refusing new payments until an operator resets its breaker.
+- alert: CorridorBreakerTripped
+  expr: increase(corridor_breaker_tripped[15m]) > 0
 ```
 
 Useful companion series: `corridor_transition{to=…}` (throughput per state),
+`corridor_breaker_refused{corridor=…}`, and
 `corridor_verb_<verb>_ms_*` (per-verb latency summary), and `corridor_duration_ms_*`
 (end-to-end). Treat a rising `held`/`failed` rate as the page-worthy signal.
+
+The Alerting port is the integration seam for paging: inject an implementation
+that turns breaker trips, `CORRIDOR_HALTED`, and held refunds into the team's
+incident channel. Keep the port asynchronous and idempotent so a metrics retry
+cannot send duplicate pages.
+
+### The circuit breaker
+
+Repeated settlement failures against one anchor are not 3 independent bad
+lunches — they are one broken anchor, and each retry spends another fee and
+another round of reconciliation to learn what you already know. The breaker
+stops that. After `recovery.breaker.consecutive_failures` consecutive lane
+failures (default **3**) the corridor is **halted**: new payments are refused
+immediately with `CORRIDOR_HALTED` / HTTP 503, and nothing is sent to the anchor.
+
+What counts as a failure: `SETTLEMENT_FAILED`, `SETTLEMENT_TIMEOUT`,
+`RECONCILE_MISMATCH`, `RECONCILE_STALLED`, and pre-settle failures (which carry
+funds — `PRESETTLE_INSUFFICIENT_FUNDS` and any `PRESETTLE_*` sibling). A
+rejected quote or a KYC denial does **not** trip it; those are the correct
+outcome of a payment you should not be making. One success clears the count.
+
+A failure is counted when the run **resolves** to `refunded` or `held`, using the
+original settlement/reconcile cause. A run that is merely parked in
+`refund_pending` (waiting on the anchor's refund report) is not counted yet.
+
+Three properties worth knowing before you rely on it:
+
+- **A halt only blocks new work.** A payment already past settlement still
+  reconciles and completes, so a halt never strands funds the anchor is holding.
+- **A halt is sticky.** Further failures do not clear it. Only an explicit
+  `reset` reopens the lane, so a still-broken anchor cannot un-halt itself.
+- **It is per-corridor.** A dead Argentine peso lane does not stop a lane to
+  Kenya.
+
+It is **opt-in**. Without a `CorridorHealthStore` in the engine's `deps.health`,
+no breaker state is kept, no gate runs, and no series are emitted — so a
+deployment that has not adopted it grows no always-zero series that looks like
+something is being measured. To adopt it, wrap the store so the counters land in
+your scrape target:
+
+```ts
+import {
+  MeteredCorridorHealthStore,
+  PostgresCorridorHealthStore,
+  PrometheusMetrics,
+} from "@corridor/engine";
+
+const health = new MeteredCorridorHealthStore(
+  new PostgresCorridorHealthStore(pool), // or InMemoryCorridorHealthStore()
+  metrics, // the SAME PrometheusMetrics the service renders
+);
+const service = createService({ corridors, deps: { ...deps, health } });
+```
+
+State lives in `corridor_breakers`, created by the same `migrate()` call as
+`corridor_runs` (§4). The increment and the threshold test are one atomic
+upsert, so concurrent failures cannot lose a count and two replicas cannot both
+claim the trip.
+
+Three counters, each labelled `corridor`:
+
+```yaml
+# The page. A lane just went from trying to refusing.
+- alert: CorridorBreakerTripped
+  expr: increase(corridor_breaker_tripped[15m]) > 0
+# Impact, not a separate incident: how much traffic the halt turned away.
+- alert: CorridorBreakerRefusing
+  expr: increase(corridor_breaker_refused[15m]) > 0
+```
+
+`corridor_breaker_tripped` fires **once per halt**, not once per failure while
+halted, so it stays quiet until an operator acts. `corridor_breaker_refused` is
+the impact side of the same incident — how much traffic the halt turned away.
+
+> `corridor_breaker_reset` is emitted only by a process that observed the reset,
+> and `corridor breaker reset` is a short-lived CLI process, so do **not** alert
+> on it. For "did anyone reopen this, and on what grounds", read the durable
+> `reset_by` / `reset_reason` / `reset_at` columns in `corridor_breakers` (shown
+> by `breaker status`) — those outlive the process that wrote them.
+
+### Reopening a lane
+
+```sh
+# What is halted, and since when, and what was the last error?
+pnpm cli breaker status
+pnpm cli breaker status ng-cn
+
+# Reopen. The reason is mandatory and is stored with the OS user who ran it.
+pnpm cli breaker reset ng-cn --reason "anchor confirmed healthy on testnet"
+```
+
+Both read `DATABASE_URL` — the same Postgres the engine uses, so the CLI and the
+service can never disagree about whether a lane is halted. Exit codes: `0`
+success, `1` environment/lookup failure (e.g. `DATABASE_URL` unset, no such
+corridor), `2` bad usage (a missing `--reason`, an unknown flag). **There is no
+`--force`**: if a reset needs justifying, that is the point of the command.
+
+Two cases to read carefully in `status`:
+
+- `UNKNOWN` means **no run has ever failed on that lane** — the absence of
+  evidence, not evidence of health. A lane with no row is accepting work.
+- `CLOSED` with a non-zero count is healthy but _near the threshold_. Check it
+  before it becomes a page.
+
+Reopen only after confirming the anchor is healthy (a testnet payment through,
+the anchor's own status page). Clearing a halt on an unfixed anchor just
+re-spends the fee that proved the lane was down. The reset is recorded, so a
+later `tripped` right after a `reset` is a fast signal that the reopen was wrong.

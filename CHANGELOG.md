@@ -15,6 +15,576 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   assumes there is task caching
   ([#285](https://github.com/ezedike-evan/corridor-in-a-box/issues/285)).
 
+### Added — every service request carries an `X-Request-Id` into the logs and the audit trail ([#269](https://github.com/ezedike-evan/corridor-in-a-box/issues/269))
+
+Engine logs and audit entries only carried `idempotencyKey` and `corridorId`,
+and the service neither assigned nor returned a request id — so an operator
+handed a `500` and a log file had no way to tie the two together.
+
+- `packages/service`: `server()` accepts an inbound `X-Request-Id` and echoes
+  it back on every response, including the transport-owned ones (413, 400 from
+  invalid JSON, 401, 404, 429, 500). An inbound id is used only if it is
+  `[A-Za-z0-9._-]{1,128}`; anything else is replaced with a fresh
+  `crypto.randomUUID()`, so a client cannot inject a log line or a header.
+- `packages/service`: `RouteResponse` gained `headers`, and `RouteRequest`
+  gained `requestId` / `traceparent`, so `route()` stays a pure function that
+  can be driven without a socket.
+- `packages/service`: a W3C `traceparent` is validated and passed through as a
+  field on the response and on every log line (full tracing is a separate
+  concern).
+- `packages/engine`: `ExecuteOptions.requestId` / `traceparent` scope the run —
+  `Logger.child(fields)` (new optional member, with `childLogger()` falling back
+  to merging for third-party loggers) and `scopedAuditSink()` wrap the deps once,
+  so _every_ emit site of a run inherits the id: transitions, the pre-settle
+  gate detail, reconcile polls, halt notices. `AuditEntry` and `AuditDetail`
+  gained optional `requestId` / `traceparent`.
+
+### Breaking — `StellarSettlementSubmitter` refuses mainnet unless it is opted in ([#275](https://github.com/ezedike-evan/corridor-in-a-box/issues/275))
+
+The "don't move real money by accident" check lived only in the example
+launchers (`examples/run-testnet.ts`, `examples/run-service.ts`,
+`scripts/assert-testnet-corridor.ts`), so an embedder wiring the library
+together themselves inherited no guard at all: the submitter picked the network
+straight from the manifest and signed whatever `settlement.network` said.
+
+- `packages/stellar`: `StellarSubmitterOptions.allowedNetworks`
+  (`readonly ("public" | "testnet")[]`) **defaults to `["testnet"]`**. A
+  corridor on a network that is not listed is refused with a non-retryable
+  `SETTLEMENT_FAILED` before `loadAccount()`, so a refusal costs no sequence
+  number, no signature and no transaction. **Embedders that settle on public
+  must now pass `allowedNetworks: ["testnet", "public"]`** — that is the whole
+  point, but it is a breaking construction-time change.
+- `packages/stellar`: a `LocalKeypairSigner` (including one built from
+  `signerSecret`) is refused on public unless `allowLocalSignerOnMainnet: true`
+  is also passed, per docs/key-management.md: a seed living in the application
+  process is a testnet convenience, not a mainnet custody model.
+- `packages/stellar`: the Horizon endpoint's own `network_passphrase` is read
+  from its root resource once, lazily, and compared with the corridor's
+  network — a testnet manifest pointed at a mainnet Horizon (or the reverse)
+  is refused rather than signed. An endpoint that cannot be reached fails
+  retryably; nothing was submitted, so retrying is safe. `fetchHorizonRoot` is
+  the test seam; the check is skipped when a fake `horizonServer` is injected
+  without it.
+- `examples/run-service.ts` and `examples/run-testnet.ts`: the submitter is
+  constructed with `allowedNetworks` derived from `CORRIDOR_ALLOW_MAINNET=1`,
+  so the launcher's opt-in and the signer's guard cannot drift apart.
+- `tests/stellar.test.ts`: public corridor without opt-in → refused with no
+  `loadAccount` call; local signer on public refused even with the network
+  allowed; explicit ack settles; endpoint/corridor passphrase mismatch refused
+  (root read once); unverifiable endpoint retryable.
+
+### Added — `tests/service-http.test.ts`: the service transport, tested over a socket ([#281](https://github.com/ezedike-evan/corridor-in-a-box/issues/281))
+
+`tests/service.test.ts` drives the pure `route()` in-process, which is the right
+way to test routing — but the transport in `server()` was mostly invisible to
+it: JSON parsing, the lowercasing of inbound headers, `resolveClientIp()` /
+`trustProxy`, the content types written on the way out, and the catch-all that
+turns an unexpected throw into a 500. Only the two body-size cases went through
+a real socket.
+
+- New black-box suite: mock adapters, mock submitter, a server on port 0, and
+  assertions on status bytes, headers and response bodies. It covers POST
+  `/payments` → 200 and reading that key back, 401 without a key, a mixed-case
+  `Authorization` still authenticating, a cross-tenant `GET /payments/:key` →
+  404, 429 after the token bucket drains, `/metrics` served as
+  `text/plain; version=0.0.4` verbatim and unmetered, a forged
+  `X-Forwarded-For` ignored by default and honoured under `trustProxy`, invalid
+  JSON → 400, and a rejecting store → 500 with the same server still answering
+  the next request.
+- Servers are closed through `gracefulShutdown()` in `afterEach`, not
+  `server.close()`, so nothing outlives the test.
+- 12 tests, ~0.3 s. No production code changed.
+
+### Fixed — `web/` reads corridor data and the state list from the repo, not hand copies ([#293](https://github.com/ezedike-evan/corridor-in-a-box/issues/293))
+
+`web/lib/corridors.ts` had hand-copied four of the six manifests and kept its
+own copy of `liveness()`, which still treated every lane as SEP-31. The
+payment runner hand-listed the engine's states.
+
+- `pnpm gen:web-data` (`scripts/gen-web-data.ts`) loads every
+  `corridors/*.corridor.yaml` with `@corridor/manifest` and reads the state
+  machine from `@corridor/engine`. It writes
+  `web/lib/generated/{corridors,states}.json`, which are committed.
+- `web/` imports those files and calls `@corridor/manifest`'s own `liveness()`,
+  so the site now shows all six corridors and reports SEP-6 lanes correctly.
+  Liveness is computed at render time, not generated: proof freshness depends
+  on today's date.
+- `@corridor/engine` exports `ALL_STATES`, and `CorridorState` is derived from it.
+- `tests/web-data.test.ts` and a CI step fail when the generated files are
+  stale.
+
+### Fixed — `RegistryRouteResolver` checks the protocol the corridor declares, not SEP-31 ([#211](https://github.com/ezedike-evan/corridor-in-a-box/issues/211))
+
+The registry-backed resolver asked every lane the same question — "is this
+anchor attested as serving SEP-31?" — and refused any answer that was not yes.
+A `protocol: sep6` corridor could therefore never clear the gate, and the
+tempting way to unblock it (adding the anchor to `allowUnattestedDomains`)
+would have quietly turned the evidence check off for that lane.
+
+- `packages/router`: `AttestationSource` now exposes
+  `serves(domain, protocol)` instead of `servesSep31(domain)`, and
+  `resolve()` asks about `protocolOf(corridor.dest)`. A SEP-6 lane is checked
+  against the SEP-6 probe, and the refusal message names the protocol
+  ("not attested as serving SEP-6 receive-side").
+- `packages/router`: `asAttestationSource()` adapts a source that only
+  implements `servesSep31`, answering `false` for every other protocol rather
+  than guessing — a source that cannot speak for a protocol is not evidence
+  that the anchor serves it. `AttestationSourceLike` is the union both shapes
+  are accepted as, so an embedder that already wired a source up keeps working.
+- `packages/router`: a bespoke `custom:<id>` lane has no on-chain probe at all,
+  so it now fails closed with a message that names the protocol and says why
+  ("no on-chain attestation probe"), instead of being refused for a SEP-31
+  reason it never had.
+- `packages/router`: `UnattestedAnchorError` carries the protocol it refused.
+- `packages/cli` and `examples/resolvers/allowlist-resolver.ts`: the
+  "no registry deployed" fallback source answers every protocol with the same
+  error, so an unconfigured deployment still fails closed.
+- `packages/stellar`: `tomlHashCheck` takes either shape of attestation source
+  (it only reads `tomlHash`).
+- `tests/registry-resolver.test.ts`: a SEP-6 corridor passes when
+  `serves(domain, "sep6")` is true and fails when only SEP-31 is attested; a
+  bespoke lane fails closed unless it is allowlisted; a SEP-31-only source
+  cannot wave a SEP-6 lane through. The existing cases run through the
+  compatibility adapter.
+
+### Added — a worked example of a bespoke HTTP anchor adapter ([#206](https://github.com/ezedike-evan/corridor-in-a-box/issues/206))
+
+`examples/adapters/http-stub/` is a complete, runnable `AnchorAdapter` for an
+anchor that speaks a proprietary HTTP API instead of SEP-31. `HttpStubAdapter`
+reports `native` quotes, `bespoke` KYC and `stellar_payment` deposit
+instructions, and drives the real engine end to end against a fictional API
+served in-process by an injected `fetchImpl`. `pnpm example:stub` runs it.
+
+Nothing in the example names a real anchor, host, endpoint or account: the
+destination is `anchor.example` (RFC 2606 reserves `.example` for exactly
+this), the routes are invented, and `tests/http-stub-adapter.test.ts` fails if
+a URL in the example points anywhere but a reserved example domain. The same
+test runs the conformance harness (`runConformance`) against the adapter, so a
+third party has a worked reference for the wiring _and_ the checks.
+
+The lane's manifest declares `protocol: custom:http-stub` and
+`endpoints.base_url`, so a bespoke destination is configuration rather than
+code: the engine needed no change to route through it, and
+`RegistryRouteResolver` still refuses it for want of an on-chain attestation
+probe unless the domain is explicitly allow-listed.
+
+### Fixed — the attester rejects a domain that is not in canonical form ([#246](https://github.com/ezedike-evan/corridor-in-a-box/issues/246))
+
+`attest` checked only that a domain was non-empty and `<= 253` bytes, so the
+registry — which keys records by the raw string and appends every key to the
+bounded `Domains` list — accepted `Cowrie.Exchange`, `cowrie.exchange.` and
+`https://cowrie.exchange/` as three permanent records for one anchor, each
+wasting one of 512 slots nobody can reclaim.
+
+`contracts/attester` now requires the canonical spelling: labels of lowercase
+letters and digits with `-` inside a label only, joined by single dots. A leading,
+trailing or doubled dot, a leading or trailing hyphen, uppercase, a scheme, a
+path, whitespace or any non-ASCII byte is `Error::InvalidDomain`. Ports are
+rejected deliberately, and the reason is documented on `is_canonical_domain`: a
+home domain is an origin, not a listener.
+
+`isCanonicalDomain` in `@corridor/probe` mirrors the rule byte for byte, and
+`AnchorAttester.attest` refuses a non-canonical domain before it loads the
+account or simulates, so `pnpm attest` fails on the spelling instead of paying to
+be reverted on chain. The same list of spellings is pinned in
+`contracts/attester/src/test.rs` and `tests/domain.test.ts`;
+`docs/operations.md` §0 states the rule where a fleet entry is added.
+
+### Added — `describeResolverContract`: the RouteResolver contract, executable ([#260](https://github.com/ezedike-evan/corridor-in-a-box/issues/260))
+
+A private resolver is written outside this repo against the `RouteResolver`
+interface, and until now nothing shipped with it that could tell its author
+whether it honours the documented contract — `tests/router.test.ts` and
+`tests/registry-resolver.test.ts` test the built-ins and are not reusable.
+
+`@corridor/router/testing` exports `describeResolverContract(name,
+makeResolver)`, which registers four cases: a decision carries a receiving
+anchor; the same intent twice yields the same anchor domain (resume safety);
+failure behaviour matches what the resolver documents, declared per resolver via
+`unresolvable` — `RegistryRouteResolver` refuses, `StaticRouteResolver` documents
+that it trusts the manifest; and `split`, if present, sums to 1. The suite hands
+the factory the fixtures it will resolve, so a third party wires its fakes to the
+domains it is actually tested against.
+
+`checkResolverContract` returns the report without registering anything and
+`expectResolverContract` throws naming each failed clause, which is how
+`tests/router.test.ts` proves — with `it.fails` — that a deliberately broken
+resolver really fails the suite. Both built-ins and
+`examples/resolvers/allowlist-resolver.ts` run it; `docs/route-resolver.md`
+documents it for out-of-repo authors. vitest is a peer dependency of the
+`./testing` subpath only.
+
+### Added — observed receive assets and a declared country on registry records ([#242](https://github.com/ezedike-evan/corridor-in-a-box/issues/242), design in [#241](https://github.com/ezedike-evan/corridor-in-a-box/issues/241))
+
+The registry could already answer "does this anchor serve SEP-31", but not "what
+does it actually receive", which is the question a corridor is built around. Two
+kinds of fact are recorded, and the distinction is the design:
+`receive_assets` is OBSERVED (the codes a SEP-31 `/info` response listed when the
+probe ran) and `country` is DECLARED (the anchor's own
+`[DOCUMENTATION] ORG_PHYSICAL_ADDRESS`, verified by nobody).
+
+- `docs/registry-metadata.md` records the decisions: its own `Meta(String)`
+  storage key rather than new fields on `Anchor`, a separate `attest_meta` write
+  with its own cooldown so a deployed attester keeps working and a sweep can
+  write both halves in one ledger, the bounds (32 assets, 32 characters per
+  code, 2 uppercase letters for a country), and why an empty list and an absent
+  one are different findings.
+- `contracts/registry`: `put_meta`, `get_meta`, `receives_asset`, an
+  `AnchorMeta` record, a `MetaAttested` event, and errors `TooManyAssets`,
+  `InvalidAssetCode`, `DuplicateAsset`, `InvalidCountry`. A domain with no
+  metadata reads `NotFound`, so a record written before this upgrade still
+  decodes and reports nothing invented. `bump` keeps the metadata entry alive
+  beside the record it describes.
+- `contracts/attester`: `attest_meta` gates on enrolment and cooldown, checks the
+  same bounds before relaying (so a caller sees the attester's error numbers
+  rather than a cross-contract revert), and `DataKey::LastMeta` holds its
+  cooldown separately from the bitmap write's.
+- `packages/probe`: `declaredCountry` maps an address line's last segment to
+  ISO-3166-1 alpha-2 through an allowlist of names and alpha-3 codes, and
+  returns nothing rather than guessing; `tomlValue` is still not a TOML parser.
+  `ProbeResult.country` is set only when the toml declared one.
+- `packages/attester`: `attestMeta` refuses locally when `sep31_info` produced no
+  observed list, so an empty list can only ever mean "asked, receives nothing".
+  Encodes `Option<String>` as Void/`String` and the asset list element-wise.
+- `packages/registry`: `AnchorAttestation.receiveAssets` / `.country` (absent, not
+  empty, when unrecorded), `getMeta` (null only for `NotFound`), `receivesAsset`,
+  `getAnchor(domain, { meta: true })`, and `RegistryContractError`.
+- `pnpm attest` submits both halves per domain; `pnpm registry:read` prints
+  "not recorded" beside "nothing — asked and it accepts no asset" as two lines
+  that mean different things.
+
+The testnet contracts are not redeployed by this change: `upgrade()` needs the
+enrolled operator key, so `contracts/deployments.json` still records the wasm
+that is live, and the hashes change when that job runs.
+
+### Added — `justfile` for the day-to-day commands ([#288](https://github.com/ezedike-evan/corridor-in-a-box/issues/288))
+
+`install`, `check`, `contracts`, `web`, `pg-test`, `anchor-up` / `anchor-down` /
+`anchor-doctor`, `secret-scan` and `ci`, each calling the same commands
+`.github/workflows/ci.yml` calls, so the local gate and CI cannot drift.
+`pg-test` starts and removes the Postgres container CI gets from a service, and
+`just --list` documents every recipe. CONTRIBUTING.md now points at `just ci`.
+
+### Added — Zeam (South Africa) probed and added as the second VERIFIED lane ([#225](https://github.com/ezedike-evan/corridor-in-a-box/issues/225))
+
+`corridors/zeam.corridor.yaml` — USD → ZAR over `mint.zeam.money`, probed
+2026-10-17 with `@corridor/probe`: SEP-10 signed a challenge and got a JWT,
+SEP-38 returned a firm quote, SEP-12 answered, and SEP-31 `/info` receives USDC
+(toml sha256 `92a309791b0eefff…`). Unlike Cowrie, Zeam publishes
+`ANCHOR_QUOTE_SERVER`, so this lane keeps `fx.quote_source: sep38`.
+`contracts/anchors.json` now probes the domain on the scheduled attester job.
+
+The payout currency is ZAR, not the KES the issue assumed: Zeam's toml anchors
+`ZARZ` (fiat ZAR) and `GBPZ`, and its Anchor Directory entry lists the
+Democratic Republic of the Congo, Malawi, South Africa, Zambia and Zimbabwe.
+
+### Added — `@corridor/sep6`: a SEP-6 withdrawal adapter on the same port ([#197](https://github.com/ezedike-evan/corridor-in-a-box/issues/197))
+
+`packages/sep6` implements `AnchorAdapter` for a `dest.protocol: sep6` corridor,
+so the engine's `quote → comply → open → settle → reconcile` run needs no
+changes to drive a SEP-6 anchor: `openTransaction` returns `stellar_payment`
+`instructions` (the anchor's `withdraw_anchor_account` and memo), and the
+on-chain leg still goes through `StellarPaymentStrategy`. The `/info` discovery
+(`info()`, `parseSep6Info`) from the scaffold is kept; before `info()` has run
+`capabilities().settlement` is `["stellar_payment"]`, and it becomes empty if
+`/info` omits or disables the dest asset.
+
+- `GET {transfer_server}/withdraw-exchange` with query params, per SEP-6
+  v4.3.0. The issue text named `POST /transactions/withdraw-exchange`, a path no
+  version of the spec defines; verified live against
+  `testanchor.stellar.org` (`TRANSFER_SERVER = https://testanchor.stellar.org/sep6`),
+  where GET returns 200 `{"id": …}` and POST returns "Request method 'POST' is
+  not supported".
+- Because that response carries no account, `openTransaction` follows up with
+  exactly one authenticated `GET /transaction?id=` and reads
+  `withdraw_anchor_account` / `withdraw_memo` / `withdraw_memo_type`. If the
+  anchor still names no account the adapter refuses instead of returning an
+  empty address — non-retryable on purpose, since SEP-6 has no idempotent
+  re-open and an automatic retry would initiate a second withdrawal.
+- The KYC-shaped answers are refusals, not instructions:
+  `non_interactive_customer_info_needed` → `KYC_REQUIRED` listing the fields,
+  `customer_info_status` denied → `KYC_REJECTED`, pending/unknown →
+  `KYC_REQUIRED`. Matched on the body's `type` before the status code.
+- `SEP-10` auth is fail-closed and cached like `@corridor/sep31`, and
+  `mapSep6Status` keeps the fail-open-to-polling discipline while adding
+  `pending_user_transfer_start`/`_complete`, `pending_user`, `pending_trust`,
+  `on_hold` and the `no_market`/`too_small`/`too_large` terminals.
+- Deliberate floors, each naming the issue that owns the design: `requestQuote`
+  is minimal and refuses without a `quote_server` (#196), `ensureCompliance`
+  refuses without a `kyc_server` rather than assuming a KYC-less lane (#193),
+  and `requestRefund` returns `REFUND_UNSUPPORTED` without a network call, as
+  SEP-6 defines no sender-initiated refund.
+
+### Added — chaos suite: no money moves unless the gate passed ([#300](https://github.com/ezedike-evan/corridor-in-a-box/issues/300))
+
+`tests/chaos.test.ts` injects one failure at a time into every step — route
+resolution, the four adapter verbs, all seven pre-settle gate checks,
+`gate.evaluate`, settle, reconcile — across `throw` / `retryable` /
+`non_retryable` / `timeout`, sweeping the three rollback policies where recovery
+differs. Per cell it asserts `submit()` was never reached when a step before
+settle failed, that money moved at most once and only after the last gate
+evaluation fully passed, and that the persisted state matches the runbook's
+terminal set. Four crash-and-resume cases cover the idempotency conflicts and
+prove a resume never re-settles. A fake clock drives every timeout, so the suite
+adds no real waiting.
+
+Two tests record a documented discrepancy rather than papering over it: a throw
+from an adapter verb or from `submit()` is not caught by `run.ts`, so `execute()`
+rejects and the stored row stays non-terminal — only gate throws are fail-closed.
+
+### Fixed — dashboard accessibility pass (#295)
+
+- `/payments`: every label is associated with its control (`useId`), the refused-amount error is tied to the field with `aria-invalid` and `aria-describedby` and focus moves to it, and each step of the state machine carries its status as text, not only colour or opacity.
+- The outcome of a run is announced through a `role="status"` live region (one note while it runs, the result once known).
+- Decorative icons are hidden from assistive technology or paired with text; headings, `nav` landmarks, `aria-current` and the theme toggle's pressed state are added; link text that repeats ("Run a payment") says which corridor.
+- A visible focus indicator, scroll padding under the sticky header, and text colours that keep 4.5:1 contrast in both themes.
+- The wording lives in `web/lib/run-status.ts` and is covered by `tests/web-run-status.test.ts`.
+
+### Added
+
+- Engine dry-run mode (#298). `execute(intent, corridor, deps, { dryRun: true })` runs quote, comply, open and the pre-settle gate against the real anchor, then stops before `settling` without calling `SettlementSubmitter.submit()` or `findExisting()`. A run that passes the gate is persisted as `failed` with the new `DRY_RUN_COMPLETE` code. Its gate results go on the audit trail and in the error's `cause` (`DryRunReport`). The code is breaker-neutral and maps to HTTP 409. Exposed as `corridor canary --dry-run` (exit `0`; rejected with `--write`) and `--dry-run` on `pnpm example` / `pnpm testnet`. The opened SEP-31 transaction is never funded and expires on the anchor's side.
+- Dashboard freshness (#296). `fetchAttestations()` returns `readAt` and the RPC's `latestLedger`. The Attested anchors section shows "Read from <network> registry at <time> · ledger N · <age> ago · refreshes every 1 hour", with the age worked out in the browser and a warning style once it passes the revalidate window. Per-anchor staleness shows an approximate duration (~5 s/ledger) next to the ledger count.
+- `mykobo.co` joins the attester anchor list in `contracts/anchors.json`. Its `stellar.toml` advertises SEP-6, SEP-24 and SEP-31, but the host it publishes for those APIs (`stellar.mykobo.co`) does not resolve, so the SEP-10 and SEP-31 probes fail and no corridor manifest is written. The probe outcome is recorded in the file's `$comment` (#226).
+
+### Added — QuoteProvider abstraction: SEP-38, adapter-native, and external pricing (#189)
+
+- Introduces `Sep38QuoteProvider` and `AdapterQuoteProvider` implementing `QuoteProvider`.
+- Refactors `Sep31Adapter.requestQuote` to delegate to `Sep38QuoteProvider`.
+- Extends corridor manifest `fx.quote_source` enum with `"native"`.
+- Adds `EngineDeps.quoteProvider` allowing operators to inject custom quote providers or factories `(corridor, adapter) => QuoteProvider`.
+- Engine validates adapter capabilities when `quote_source: "native"` is configured and dispatches quoting to `AdapterQuoteProvider`.
+
+### Added — Engine: read adapter capabilities instead of assuming SEP-31 behaviour (#188)
+
+- Engine executes `checkCompatibility(corridor, caps, strategies)` before external adapter calls.
+- Adds `CAPABILITY_MISMATCH` to `CorridorErrorCode` (mapped to HTTP 422 in service layer and documented in API docs).
+- Fails execution with `CAPABILITY_MISMATCH` if corridor requires quotes (e.g. `sep38`) but adapter capabilities report `quotes: ["none"]`, or if adapter settlement capabilities are empty or have unsupported settlement kinds not covered by available settlement strategies.
+- Skips compliance / KYC step during execution and resume when adapter capabilities declare `kyc: "none"`.
+
+### Added — `OpenTransaction.instructions` discriminated union (#183)
+
+- Add `DepositInstructions` discriminated union (`stellar_payment`, `claimable_balance`, `adapter_settled`) to `@corridor/adapter-kit`.
+- Update `OpenTransaction` to carry `instructions: DepositInstructions` while retaining deprecated optional `depositAddress`, `memo`, and `memoType` fields and adding `toLegacy()` helper for single-release backward compatibility.
+- Update `Sep31Adapter` and `createMockAdapter` to return `instructions` with `kind: "stellar_payment"`.
+- Update `settle()` in `@corridor/engine` to switch on `instructions.kind` and fail closed (`SETTLEMENT_FAILED`, non-retryable) on unhandled instruction kinds before attempting payment submission.
+
+### Added — `--json` flag to `pnpm probe:anchor` (#232)
+
+- Adds `--json` flag parsing to `examples/probe-anchor.ts` accepted in any argv position.
+- Suppresses banner and human logs when `--json` is supplied, streaming only the serialized JSON probe result to stdout.
+- Introduces `formatProbeResultJson` and `parseProbeArgs` in `@corridor/probe`, formatting raw bitmasks alongside decoded SEP numbers and executed/passed probe lists.
+
+### Added: SEP-6 adapter scaffold with GET /info discovery
+
+`@corridor/sep6` implements the receiving-side `AnchorAdapter` for SEP-6
+anchors. It parses `GET {transfer_server}/info` (the `withdraw` and
+`withdraw-exchange` sections), caches the result on the adapter instance, and
+derives `capabilities()` from it. The transfer verbs fail closed with
+`ANCHOR_UNAVAILABLE` until their issues land (#196, #197, #198). SEP-10 auth is
+deliberately not wired here; it waits on the shared client from #194.
+
+### Fixed — a resumed recovery run reports its real cause to the circuit breaker
+
+After a restart, a run resumed from `recovering` or `refund_pending` used to be
+judged by a synthesized `RECONCILE_MISMATCH` ("receiving transaction … was
+refunded"), so the lane's stored `lastError` never showed what actually went
+wrong. The run's persisted `lastError` ("CODE: message") is now read back and
+used when its code is one the breaker already counts as a lane failure. Anything
+else (no `lastError`, one that does not parse, a neutral code) falls back to the
+old behaviour, so a resume is never judged more leniently than before.
+
+### Maintenance — remaining valid test fixtures declare `protocol: sep31`
+
+`canary-capped`, `limits`, `proven` and `stale-proof` now state their
+destination protocol explicitly, so parsing them no longer yields the legacy
+deprecation warning. `invalid.corridor.yaml` is left as it was, on purpose.
+
+### Added — pre-settle gate results are logged per check and copied into the audit trail ([#142](https://github.com/ezedike-evan/corridor-in-a-box/issues/142))
+
+Building on `AuditEntry.checks`, each gate check on the transition out of
+`verifying` is now also logged as `corridor.gate.check` — `info` when it
+passed, `warn` when it failed — and the audit entry takes a copy of the
+`checks` array, so a caller mutating its array afterwards cannot change what was
+recorded. `CheckResult.detail` is documented as PII-free: ids, amounts, asset
+codes, G-addresses and statuses only.
+
+### Added — Legacy flat SEP-31 dest endpoints: deprecation warning (#180)
+
+- `parseCorridor` / `loadCorridor` now return `warnings: string[]` on success (additive; still assignable to `Outcome<Corridor>`).
+- A destination with no `protocol` (legacy flat SEP-31 endpoints) still parses as `sep31` and now yields a deprecation warning.
+- A destination with no `protocol` but a `transfer_server` or `base_url` endpoint is rejected with guidance to set `protocol: sep6` or `protocol: custom:<name>`.
+
+### Added — `fx.quote_source: external` path (#190)
+
+- `ExternalQuoteProvider` and `EngineDeps.externalQuote`: operators inject a
+  pricing function for corridors with no SEP-38 server. Quotes are `firm: false`;
+  no SEP-38 call is made. `external` + `who_holds_risk: receiving_anchor` is
+  refused before `open` unless the adapter reports `native` quotes.
+- Minimal shim for #187/#189: `AdapterCapabilities` and `AnchorAdapter.capabilities()`
+  (implemented by `Sep31Adapter` and the mock, which takes `capabilities` overrides)
+  and the `QuoteProvider` interface. `capabilities()` is now required on
+  `AnchorAdapter`, a breaking change for out-of-tree adapters.
+
+### Added — `AccountInspector` reads live reserve/fee and our payment history (2026-09-30)
+
+`AccountInspector` in `@corridor/stellar` is now the one read-only Horizon
+seam every chain-facing check reuses
+([#149](https://github.com/ezedike-evan/corridor-in-a-box/issues/149)):
+
+- `baseReserve()` and `baseFee()` read the latest ledger (stroops converted
+  with BigInt, never floats) instead of returning constants. The
+  `baseReserve`/`baseFee` constructor options still pin a value.
+- New `paymentsFrom(source, { to?, sinceLedger? })` returns our outgoing
+  payments, newest first, each joined with its transaction's memo and memo type.
+  It reads at most `maxPages` pages and reports `truncated` when it stopped
+  early, so a duplicate-send check can tell "not found" from "didn't look".
+- The constructor takes a narrowed, structural `InspectorHorizonLike` fake;
+  a real `Horizon.Server` satisfies it without a cast.
+- A trustline whose authorization Horizon doesn't report now reads as
+  `is_authorized: false` (was `true`). Only a 404 / `NotFoundError` means
+  "account does not exist"; an error whose message merely says "not found"
+  is now a retryable failure.
+
+### Added — verify the settle payment on-chain before reconcile
+
+- New optional `EngineDeps.chainVerifier`. After `settled` (and on resume from
+  `settled`) the engine re-checks the payment; a mismatch is a non-retryable
+  `RECONCILE_MISMATCH` routed through the manifest's `hold` / `refund_sender`
+  policy. `@corridor/stellar` provides `createChainVerifier(new AccountInspector(...))`,
+  `AccountInspector.settlementFacts(hash)` and `verifySettlementFacts()` (one
+  payment op; destination, amount, asset and memo/memo type must match).
+- Runs now record the `settlement` request so a resumed run can re-verify;
+  Postgres stores add a nullable `settlement` column (added by `migrate()`).
+
+### Fixed — operations.md §1 step 4 described output a reader could never see (closes #129)
+
+`docs/operations.md` step 4 instructed readers to run
+`pnpm cli plan corridors/reference.corridor.yaml` and said it "must report the lane
+runnable (no liveness warnings)". The reference corridor points at `localhost` and
+has no `endpoints_verified_at` by design — setting that field on a localhost manifest
+would be meaningless — so `plan` always prints `UNVERIFIED` plus a warning about
+unconfirmed endpoints. Step 4 was therefore impossible to pass as written, which
+stopped readers dead.
+
+The step now shows the actual expected output and explains what the pre-flight is
+really checking: that the manifest parses (exit 0), that liveness is **not** `NOT
+RUNNABLE` (all required endpoint fields are present), and that it is **not**
+`✓ VERIFIED` (a localhost manifest reporting verified would be the lie to catch).
+The live readiness check — containers up, SEP-31 receiving, observer cursor in range
+— is `reference-anchor.sh doctor`, and the step now points there explicitly.
+
+### Changed — anchor-side terminal failure after settle enters `refund_pending`
+
+- Under `rollback: refund_sender`, when money has moved and the anchor reports a
+  terminal failure, the run now goes `recovering -> refund_pending` and waits for
+  the anchor's refund report instead of calling `submitter.refund` (which the real
+  submitter always refuses). `reconcileUntil` now carries the terminal
+  `TransactionStatus` on the error's `cause` (`anchorTerminalStatus()`). Timeouts,
+  stalls, the no-hash path and the `hold` / `manual` policies are unchanged.
+
+### Added — per-corridor reconcile cadence
+
+- Manifests can set `recovery.reconcile: { poll_seconds?, stall_polls? }`
+  (`stall_polls: 0` disables stall detection). Resolution order is manifest,
+  then `EngineDeps.reconcilePollMs` / `stallThreshold`, then 2s / 10 polls; it
+  applies to resumed runs too. `liveness()` warns when
+  `poll_seconds x stall_polls` is not below `timeout_seconds`.
+
+### Added — `source.protocol` declares how the sending side is reached (#182)
+
+`source` now takes an optional `protocol`: `prefunded` (default; the operator
+already holds the bridge asset, needs only `name`/`asset`), `sep6` (requires
+`endpoints.transfer_server`), `sep24` (requires `endpoints.transfer_server_sep24`
+and `endpoints.web_auth`), or `custom:<id>` (requires `endpoints.base_url`).
+Schema only; the engine does not act on it yet. Manifests that omit `protocol`
+parse as `prefunded`, so existing corridors are unchanged. `corridor plan` now
+prints the source protocol.
+
+### Added - Per-corridor circuit breaker with a CLI and Prometheus counters (#165)
+
+Repeated settlement failures against one anchor are one broken anchor, not N
+incidents, and each retry spends another fee to relearn the same fact. After
+`recovery.breaker.consecutive_failures` consecutive lane failures (default `3`)
+the corridor is **halted**: new payments are refused with `CORRIDOR_HALTED`
+(HTTP 503) before a run is created, so nothing reaches the anchor. A run already
+past settlement still reconciles and completes — a halt blocks new work, never
+money the anchor is holding. A halt is sticky: only an explicit reset reopens it.
+
+- `@corridor/manifest`: optional `recovery.breaker.consecutive_failures`.
+- `@corridor/engine`: `CorridorHealthStore` port, `InMemoryCorridorHealthStore`,
+  `PostgresCorridorHealthStore` (one atomic upsert, so concurrent failures cannot
+  lose a count or double-claim a trip), and `MeteredCorridorHealthStore`. The
+  `corridor_breakers` table ships from the existing `migrate()` entry point.
+  This replaces #366's unwired stub store (`health-pg.ts`); the public names
+  `CorridorHealthStore` and `PostgresCorridorHealthStore` now come from the
+  breaker implementation.
+- **Table migration:** databases that ran `migrate()` since #366 already hold an
+  older `corridor_breakers` (states `up`/`down`, no `reset_at`). `migrate()` now
+  adds `reset_at`, changes the `state` default to `closed`, and maps legacy
+  `up` -> `closed` and `down` -> `open`. All statements are idempotent; re-run
+  `migrate()` once on upgrade.
+- A lane failure is counted when a run resolves to `refunded` or `held` (using the
+  original settlement/reconcile cause), not when it parks in `refund_pending`.
+- Metrics: `corridor_breaker_tripped` (once per halt), `corridor_breaker_refused`
+  (traffic turned away) and `corridor_breaker_reset`, each labelled `corridor`.
+  Opt-in — with no `deps.health` there is no gate, no state, and no series.
+- `corridor breaker status [corridorId]` and `corridor breaker reset <id>
+--reason "…"`, reading the same `DATABASE_URL` the engine uses. The reason is
+  mandatory and stored with the OS user who ran it; there is no `--force`.
+- Runbook and alerting in `docs/operations.md` §7.
+
+### Added — `corridor canary` records a chain-verified proof in the manifest (2026-09-27)
+
+`corridor canary <file> --amount <decimal> [--write]` drives one tiny real
+payment and, on `completed`, prints the `proof:` block it earned. With
+`--write` it also records that block in the manifest through the `yaml` Document
+API, so every hand-written comment in the file survives the edit.
+
+The proof is chain-verified, not engine-asserted: before any write,
+`AccountInspector.settlementFacts()` reads the settlement back from Horizon and
+`verifySettlementFacts()` checks destination, amount, asset and memo
+against the run. A `failed`, `held` or `refunded` run returns before the
+manifest is even read, leaving it byte-identical.
+
+Liveness gains a fourth state, `PROVEN`, for a corridor whose `proof` is still
+inside `proof.max_age_days` (default 30). A stale proof drops the lane back to
+`VERIFIED` with a warning; a proof on a lane whose endpoints were never verified
+never promotes it. `canary_max_amount` (default `10.00` until recorded) caps
+future canaries. `proof` is optional, so every existing manifest still parses.
+
+### Added — corridor canary CLI command (#161) (2026-09-30)
+
+Added `corridor canary <file.corridor.yaml> --amount <amount> [--network public]` CLI subcommand
+and shared wiring module (`@corridor/cli/wire`):
+
+- Drives one full, gated payment through the real stack (`Sep31Adapter`, `StellarSettlementSubmitter`, pre-settle gate, `RegistryRouteResolver`).
+- Refuses unless amount ≤ `proof.canary_max_amount` (defaults to `10.00`) and corridor liveness is at least `verified`.
+- Requires `--network public` to run on mainnet; default refuses mainnet manifests.
+- Pre-settle gate (`balanceCheck`) verifies sender balances and reserve before on-chain settlement.
+- Engine: added optional `gate` to `EngineDeps` and evaluate before advancing to `settling`.
+- Manifest: added optional `proof.canary_max_amount` to `CorridorSchema`.
+- Reused wiring in both CLI canary subcommand and `examples/verify-corridor.ts`.
+
+### Docs — `web/README.md` matches the app again: three liveness states, six docs pages, own workspace root (#126) (2026-09-29)
+
+`web/README.md` described the app it documents in three stale ways: it called the
+dashboard's build-time liveness "runnable / not runnable" when the dashboard has
+three states — `verified` / `unverified` / `not runnable`, and only `verified`
+counts as runnable — it listed five of the six shipped docs pages (omitting "Why
+not Anchor Platform?"), and it called the app "not part of the pnpm workspace"
+although `web/` has been its own pnpm workspace root since #80
+(`web/pnpm-workspace.yaml`, with its own lockfile and its own CI job).
+Documentation only — no code, no behaviour change.
+
+### Added — Gate check: re-read receiver SEP-12 status and require ACCEPTED (#156) (2026-09-30)
+
+Added `receiverKycCheck(adapter)` GateCheck (name `sep12.receiver`) in `@corridor/sep31`:
+
+- Calls `adapter.ensureCompliance(intent, corridor)` right before settlement to verify receiver status is still accepted.
+- Fails closed with `PRESETTLE_RECEIVER_NOT_ACCEPTED` on `PROCESSING`, `NEEDS_INFO`, `REJECTED`, or anchor errors (e.g. HTTP 500).
+- For corridors without a `kyc_server`, passes with `detail: "no SEP-12 server"` so the audit trail clearly distinguishes unverified lanes from verified ones.
+- Added `PRESETTLE_RECEIVER_NOT_ACCEPTED` to `CorridorErrorCode` in `@corridor/types`.
+
 ### Maintenance — ESLint 10 landed
 
 - `eslint` 10 landed in [#37](https://github.com/ezedike-evan/corridor-in-a-box/pull/37).
@@ -23,6 +593,137 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 - Until a `v0.1.0` tag exists, [Unreleased] links to repository commit history
   rather than a release comparison. The historical 0.1.0 section below remains
   unlinked until its release commit can be tagged.
+
+### Added — Pre-settle gate and corridor-halt error codes (#139) (2026-09-25)
+
+Added 9 dedicated pre-settle gate and circuit breaker error codes to `CorridorErrorCode`:
+
+- `PRESETTLE_ANCHOR_DRIFT` — live /info or stellar.toml no longer matches what was verified
+- `PRESETTLE_TX_MISMATCH` — the opened anchor transaction is not what we are about to pay
+- `PRESETTLE_DESTINATION_UNSAFE` — destination missing, no trustline, or not authorized
+- `PRESETTLE_INSUFFICIENT_FUNDS` — our balance cannot cover amount + fee + reserve
+- `PRESETTLE_QUOTE_WINDOW` — firm quote will not survive settle + confirm
+- `PRESETTLE_AMOUNT_OUT_OF_RANGE` — outside anchor or manifest min/max
+- `PRESETTLE_RECEIVER_NOT_ACCEPTED` — SEP-12 status is no longer ACCEPTED
+- `CORRIDOR_UNPROVEN` — amount above the canary cap on a non-PROVEN lane
+- `CORRIDOR_HALTED` — per-corridor circuit breaker is open
+
+Added helper `isPreSettleCode(code): boolean` in `@corridor/types` and mapped the error codes in `@corridor/service` HTTP router.
+
+### Added — `TransactionStatus` carries the anchor's expected amount, deposit account and memo (2026-09-26)
+
+`Sep31Adapter.getTransaction` read only `status`, `amount_in`,
+`amount_in_asset` and `refunds` off `GET /transactions/:id`, so the opened
+transaction could not be cross-checked against the payment about to be sent.
+
+`TransactionStatus` now has optional `amountIn` (`Money`), `depositAddress`,
+`memo` and `memoType`, parsed from `amount_in`/`amount_in_asset`,
+`stellar_account_id`, `stellar_memo` and `stellar_memo_type`. As with
+`refunds`, each is read on its own and anything malformed — including a numeric
+`amount_in` — is omitted, never guessed; status classification is unchanged.
+`createMockAdapter` reports back what each opened transaction was given. The
+change is additive: other adapters may leave the fields undefined.
+
+### Changed — web/ migrated to Next.js 16 and TypeScript 7 (#85) (2026-09-02)
+
+`web/`'s `next` 15 → 16 bump landed in #11 as a dependency change only; the
+migration itself is now done. `web/tsconfig.json` sets the React automatic
+runtime and the generated route-type include that Next 16 mandates (it was being
+rewritten by `next build` on every run, leaving the checked-in file out of step
+with what was compiled), and `web/next.config.ts` pins `outputFileTracingRoot`
+to the repo root so the workspace-root warning is gone with it. No application
+source changed.
+
+### Added — `reference-corridor` CI job runs a whole corridor (#75) (2026-09-02)
+
+`.github/workflows/reference-corridor.yml` drives one payment through every leg
+— quote → comply → open → settle → reconcile → completed — against the Anchor
+Platform reference stack, on its own schedule. `scripts/reference-anchor.sh
+doctor` and `pnpm verify:corridor` gate the job up front, so a missing or
+renamed prerequisite is reported in seconds rather than four minutes into a
+container.
+
+### Added — reconcile stall detection: `RECONCILE_STALLED` (HTTP 504) (#71) (2026-09-01)
+
+`reconcileUntil` can now tell an anchor that is slowly progressing apart from
+one whose observer is stuck on the same status. When `stallThreshold` is set
+(production default 10 consecutive polls; `0` disables it) and that many polls
+return an identical status, the engine fails early with the new public error
+code **`RECONCILE_STALLED`**, carrying the stuck status and the consecutive
+count, and recovers (refund / hold / give-up) instead of waiting out the whole
+corridor deadline. `RECONCILE_STALLED` maps to **HTTP 504** in
+`@corridor/service`, alongside `SETTLEMENT_TIMEOUT`.
+
+### Changed — every reconcile poll is logged and counted (#69) (2026-09-01)
+
+`reconcileUntil` was silent between "submitted" and "settled". The engine's
+injectable `Logger` and `Metrics` are now threaded through it, and each poll
+emits a `debug` log (`corridor.reconcile.poll` with `transactionId`,
+`status`, `poll` and `elapsedMs` — never full transaction bodies) plus a
+counter metric tagged with `corridor` and `status`. `LogLevel` gains
+`"debug"` for this.
+
+### Changed — `SETTLEMENT_TIMEOUT` carries poll count, elapsed, and first/last status (#70) (2026-09-01)
+
+The timeout error used to name only the last observed status, which made a slow
+anchor indistinguishable from one that never updated. It now carries the poll
+count, elapsed milliseconds, and both the first and last observed status, and
+stays non-retryable so a timeout can never re-settle a payment.
+
+### Added — anchor-driven refunds on the `AnchorAdapter` port (#72) (2026-09-01)
+
+A payment credited to a third-party anchor cannot be reversed unilaterally
+on-chain, so refunds are modelled as an anchor-driven operation.
+`AnchorAdapter` gains `requestRefund(transactionId, amount, reason)` and the
+`RefundPayment` / `RefundStatus` / `RefundRef` types; an anchor that does not
+support refunds rejects with `REFUND_UNSUPPORTED`. The engine wiring that polls
+an anchor-driven refund is deliberately not part of this change.
+
+### Added — mock adapter can simulate refund outcomes (#77) (2026-09-01)
+
+`MockAdapterOptions` gains a `refund` flag so tests can choose a branch: the
+anchor accepts and completes a refund, accepts and leaves it pending, or rejects
+it. Defaults are unchanged, so existing tests and engine behaviour are untouched.
+
+### Tests — live-anchor run asserts `completed`, not merely `settled` (#73) (2026-09-01)
+
+The SEP-31 live suite exercised SEP-10, SEP-38 and the conformance probes but
+never asserted the terminal state. A new env-gated case runs a full `execute()`
+for one payment and asserts the run reaches `completed` and that the trail
+contains `settled → reconciled → completed` in order. On failure it prints the
+stored state, trail, `lastError`, anchor transaction id and Stellar tx hash
+instead of a diff.
+
+### Tests — engine coverage for the refund path (#74) (2026-09-01)
+
+`refundAndStop` had no tests of its own even though every branch in it runs
+after something has already gone wrong. Six new cases cover which terminal state
+is reached, which reason is recorded, and whether the chain was touched. The
+anchor-driven `refund_pending` polling path stays uncovered until the engine
+wires it up.
+
+### Tests — crash-resume integration test never double-settles (#76) (2026-09-01)
+
+An env-gated integration test runs a payment to `completed`, simulates a crash
+by winding the persisted run back to `settled`, then resumes with the same
+idempotency key and asserts the run completes through
+`settled → reconciled → completed` with exactly one on-chain payment ever
+submitted.
+
+### Changed — `web/` is its own pnpm workspace root (#80) (2026-09-01)
+
+Dependabot could never update `web/pnpm-lock.yaml`: with no workspace marker of
+its own, a resolver starting in `web/` walked up to the root workspace, saw
+`web` was not an importer there, and wrote no lockfile, so every `/web` PR
+failed `ERR_PNPM_OUTDATED_LOCKFILE`. Adding `web/pnpm-workspace.yaml` makes
+`web/` a standalone workspace root.
+
+### Changed — dependency bumps (#78, #79, #81, #82, #11) (2026-09-01)
+
+Dependabot bumps: `github/codeql-action` to v4.37.6 (#78), `@types/node` to
+^26.4.0 in `/web` (#79), `react-markdown` 9.1.0 → 10.1.0 in `/web` (#81),
+`lucide-react` 0.456.0 → 1.24.0 in `/web` (#82), and the `next` 15.5.19 →
+16.3.3 bump in `/web` (#11, migration finished in #85).
 
 ### Changed — attester rejections carry a typed contract error code (2026-09-24)
 
@@ -40,6 +741,31 @@ contract itself rejected the attestation, the error carries its number as
 `examples/attest.ts` now checks `contractError === AttesterContractError.TooSoon`.
 The error `code` and message text are unchanged, so existing callers keep
 working.
+
+### Breaking — Pre-settle gate mandatory by default with explicit named opt-out (2026-09-25)
+
+The pre-settle gate is now mandatory before settlement execution. In `EngineDeps`, callers must supply either `gate: PreSettleGate` (e.g. `defaultSep31Gate()`) or explicitly opt out with `unsafeSkipPreSettleGate: true`. If neither is provided, `execute()` fails fast immediately with error code `ENGINE_MISCONFIGURED` before claiming the idempotency key (ensuring no run row is persisted).
+
+When opted out via `unsafeSkipPreSettleGate: true`, the engine passes through the `verifying` state, emits a warning log, and records a synthetic `gate.skipped` check on the transition audit entry. The `CompositeGate` runs checks concurrently, fail-closed, recording results on the `AuditEntry` and incrementing the `corridor.gate.check` metric.
+
+### Added — `verifying` state between `opened` and `settling` (2026-09-25)
+
+The engine moved straight from `opened` to `settling`, so a pre-settle gate done
+inside `opened` would have been invisible in the trail — `opened -> failed` could
+mean either "the anchor rejected the open" or "we refused to pay" — and it would
+have run only once, while a retry re-entered `settling` after a backoff during
+which balances, quote validity and anchor status can all change.
+
+`verifying` makes the gate an auditable fact and, more importantly, an
+unskippable one. `settling` is now reachable ONLY from `verifying`, so a
+control-flow bug in `run.ts` cannot bypass it — the same "unreachable by
+construction" argument the recovery states already make. `opened` and `retrying`
+lost their direct edges into `settling`; every attempt walks
+`opened -> verifying -> settling` on the first pass and
+`retrying -> verifying -> settling` after a retry. A refusal is `failed`, never
+`recovering`, because no money has moved and there is nothing to unwind. The
+state and engine wiring shipped with the pre-settle gate (#353); this entry adds
+the property tests that pin the invariant (#138).
 
 ### Added — Gate check: balance covers amount, fee and minimum reserve (#151) (2026-09-25)
 

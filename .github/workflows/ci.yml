@@ -5,6 +5,20 @@ on:
   pull_request:
 
 jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # Fail the job only; no PR comments, so the token needs no write scope.
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
   # The Soroban contracts are a separate toolchain from the TypeScript monorepo,
   # so they get their own job: fmt, clippy-as-errors, the full test suite, and a
   # real wasm build. The wasm build matters — a contract that compiles natively
@@ -36,7 +50,7 @@ jobs:
       # Version comes from package.json "packageManager" (pnpm@9.x); do not also
       # pass `version:` here or action-setup errors on the duplicate.
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: pnpm
@@ -44,6 +58,15 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      # web/ renders corridor data and the state list generated from the
+      # manifests and the engine. Fail when the committed copy has drifted.
+      - name: Check web/lib/generated is up to date
+        run: |
+          pnpm gen:web-data
+          git diff --exit-code web/lib/generated || {
+            echo "::error::web/lib/generated is stale. Run 'pnpm gen:web-data' and commit the result."
+            exit 1
+          }
 
   # Exercises PostgresIdempotencyStore against a real Postgres (the atomic claim
   # + version-guarded upsert that guard against double-settlement). The test is
@@ -69,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: pnpm
@@ -88,7 +111,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Version resolves from the root package.json "packageManager" field.
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: pnpm
@@ -97,5 +120,6 @@ jobs:
       # root (web/pnpm-workspace.yaml, #80), so pnpm must treat it as a standalone
       # project rather than resolving the repository root workspace.
       - run: pnpm install --frozen-lockfile --ignore-workspace
+      - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm build
