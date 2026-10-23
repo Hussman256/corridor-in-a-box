@@ -29,10 +29,12 @@ anchor pair, and adding a new corridor is a new \`*.corridor.yaml\` file — not
    Corridor #2 is a YAML file, not a code change.
 2. **engine ↔ adapters** — the engine knows only the \`AnchorAdapter\` interface;
    every standards-compliant anchor shares one adapter.
-3. **router seam** — the open repo ships a \`RouteResolver\` interface plus a
-    trivial default. A health-/rate-weighted resolver could be supplied as a
-    separate proprietary component, but none is included or injected today.
-    The interface is an extension seam, not evidence that such a component exists.
+3. **router seam** — the open repo ships a \`RouteResolver\` interface plus two
+   resolvers: \`StaticRouteResolver\` (trust the manifest) and
+   \`RegistryRouteResolver\` (require a fresh on-chain attestation). A
+   health-/rate-weighted resolver could be supplied as a separate proprietary
+   component, but none is included or injected today. The interface is an
+   extension seam, not evidence that such a component exists.
 `,
   },
   {
@@ -53,7 +55,7 @@ pnpm cli plan corridors/reference.corridor.yaml   # offline liveness check
 \`pnpm example\` walks a payment through every state and proves idempotency:
 
 \`\`\`
-created -> quoted -> compliant -> opened -> settling -> settled -> reconciled -> completed
+created -> quoted -> compliant -> opened -> verifying -> settling -> settled -> reconciled -> completed
 replay with same key -> idempotent return (state=completed)
 \`\`\`
 
@@ -65,8 +67,9 @@ pnpm install
 pnpm dev   # http://localhost:3000
 \`\`\`
 
-The **Run a payment** page drives a faithful simulation of the engine. Set
-\`CORRIDOR_SERVICE_URL\` to point it at a real \`@corridor/service\` instance.
+The **Run a payment** page drives a simulation of the engine's state machine (a
+re-implementation; it can drift). Set \`CORRIDOR_SERVICE_URL\` to drive a real
+\`@corridor/service\`.
 `,
   },
   {
@@ -81,12 +84,22 @@ packages/
   manifest/      Zod schema for a corridor + loader
   adapter-kit/   AnchorAdapter port + conformance probes + mock adapter
   sep31/         ONE generic adapter (SEP-10 auth + SEP-12 KYC)
-  stellar/       the ONLY chain-touching package: settlement submitter + SEP-10 signer
+  sep6/          ONE generic adapter (GET /info discovery + capabilities)
+  stellar/       the only money-path package that touches the chain:
+                 settlement submitter + SEP-10 signer
   router/        RouteResolver seam — open interface + static default
   engine/        orchestration: state machine, crash-resume, recovery, audit, metrics
   service/       thin HTTP API over the engine (auth + rate limiting)
   cli/           validate a manifest; print an offline runnability plan
+  probe/         probe an anchor's SEP conformance from its stellar.toml
+  registry/      read conformance attestations from the on-chain registry
+  attester/      submit probe results to the registry via the attester contract
+contracts/       Soroban registry + attester contracts
 \`\`\`
+
+\`stellar/\` is the only package on the money path that touches the chain.
+\`probe/\`, \`registry/\` and \`attester/\` read and write the conformance
+registry; they never move funds.
 
 ## The five verbs
 
@@ -98,9 +111,34 @@ packages/
 | 4 | settle | native Stellar payment of the bridge asset |
 | 5 | reconcile | SEP-31 \`GET /transactions/:id\` |
 
+## The state machine
+
 A persisted state machine drives \`created → quoted → compliant → opened →
-settling → settled → reconciled → completed\`, with \`recovering → refunded / held\`
-for failures. Every transition is logged, audited, and counted.
+verifying → settling → settled → reconciled → completed\`. Every transition is logged,
+audited, and counted. The full table, from \`packages/engine/src/state.ts\`:
+
+| State | Possible next states |
+|---|---|
+| \`created\` | \`quoted\`, \`failed\` |
+| \`quoted\` | \`compliant\`, \`recovering\`, \`failed\` |
+| \`compliant\` | \`opened\`, \`recovering\`, \`failed\` |
+| \`opened\` | \`verifying\`, \`recovering\`, \`failed\` |
+| \`verifying\` | \`settling\`, \`failed\` |
+| \`settling\` | \`settled\`, \`retrying\`, \`recovering\`, \`failed\` |
+| \`retrying\` | \`verifying\`, \`recovering\`, \`failed\` |
+| \`settled\` | \`reconciled\`, \`recovering\`, \`failed\` |
+| \`reconciled\` | \`completed\`, \`failed\` |
+| \`recovering\` | \`refund_pending\`, \`refunded\`, \`held\`, \`failed\` |
+| \`refund_pending\` | \`refunded\`, \`held\`, \`failed\` |
+| \`completed\` | terminal |
+| \`refunded\` | terminal |
+| \`held\` | terminal |
+| \`failed\` | terminal |
+
+\`retrying\` is entered only when a settle attempt failed before money moved,
+and is the only state that may re-enter \`verifying\`. \`recovering\` and
+\`refund_pending\` can be entered after settlement, so neither can reach
+\`settling\` — a double-spend is unreachable by construction.
 `,
   },
   {
@@ -138,8 +176,11 @@ Body is a \`PaymentIntent\`:
 | \`409\` | \`IDEMPOTENCY_CONFLICT\` | Replay with conflicting parameters or in-flight payment with same key |
 | \`409\` | \`QUOTE_EXPIRED\` | Anchor quote expired before settlement could begin |
 | \`409\` | \`KYC_REQUIRED\` | Customer KYC incomplete or customer action required |
+| \`409\` | \`MANIFEST_CHANGED\` | Corridor manifest changed since the run started; resume refused before settle |
+| \`409\` | \`DRY_RUN_COMPLETE\` | A \`dryRun: true\` run passed the pre-settle gate and stopped before settling; nothing was sent. The HTTP API never starts dry runs, so this code only appears from the engine or CLI |
 | \`413\` | \`payload too large\` | Request body exceeds \`maxBodyBytes\` cap (default 64 KiB) |
 | \`422\` | \`AMOUNT_INVALID\` | Amount is not a positive decimal or cannot be settled |
+| \`422\` | \`CAPABILITY_MISMATCH\` | Adapter capabilities do not match corridor manifest or settlement strategies |
 | \`422\` | \`MANIFEST_INVALID\` | Corridor manifest validation failed |
 | \`429\` | \`rate_limited\` | Token-bucket rate limit exceeded for client IP or API key |
 | \`500\` | \`SETTLEMENT_FAILED\` | On-chain Stellar payment transaction failed |
@@ -148,6 +189,7 @@ Body is a \`PaymentIntent\`:
 | \`501\` | \`REFUND_UNSUPPORTED\` | Payment failed and anchor does not support refund |
 | \`502\` | \`QUOTE_UNAVAILABLE\` | Origin or destination anchor failed to provide a quote |
 | \`502\` | \`ANCHOR_UNAVAILABLE\` | Upstream anchor service unreachable or returned an upstream error |
+| \`503\` | \`CORRIDOR_HALTED\` | Circuit breaker is open for this corridor: too many consecutive lane failures. No run was created and nothing was sent to the anchor. Retry is pointless until the lane is reset — see \`docs/operations.md\` §7. Non-retryable |
 | \`504\` | \`SETTLEMENT_TIMEOUT\` | Stellar network submission timed out |
 | \`504\` | \`RECONCILE_STALLED\` | Anchor transaction polling timed out |
 
@@ -201,12 +243,12 @@ across two anchors_ and move the on-chain bridge asset between them. They are
 complementary — in a real lane the receiving anchor runs the Anchor Platform and
 this engine talks to it.
 
-| | Anchor Platform | corridor-in-a-box |
+| Aspect | Anchor Platform | corridor-in-a-box |
 |---|---|---|
 | Who runs it | An anchor | A remittance operator / PSP |
 | Role | Serve SEP endpoints | Orchestrate a payment end-to-end |
 | Owns the settle leg | No | Yes (native Stellar payment) |
-| Multi-anchor routing | No | Yes (RouteResolver seam) |
+| Multi-anchor routing | No | Seam only (\`RouteResolver\`); no multi-anchor resolver ships yet |
 | Idempotency / recovery | N/A | Core |
 `,
   },

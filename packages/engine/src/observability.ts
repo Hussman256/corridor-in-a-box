@@ -3,7 +3,10 @@
 // the fact, so every state transition is both logged and recorded as an immutable
 // audit entry. Both sinks are injected; the engine never reaches for a global.
 
+import type { Money } from "@corridor/types";
 import type { CorridorState } from "./state";
+import type { LivenessState } from "@corridor/manifest";
+import type { CheckResult } from "./gate";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -13,6 +16,33 @@ export interface LogFields {
 
 export interface Logger {
   log(level: LogLevel, msg: string, fields?: LogFields): void;
+  /**
+   * Optional scoping convention: return a logger that stamps `fields` on every
+   * line it emits, so a caller can attach per-request context (a request id, a
+   * trace id) once instead of threading it through every call site. Sinks that
+   * already keep a structured context (pino, winston) should implement this and
+   * return their own child; everyone else gets the merging wrapper from
+   * `childLogger`.
+   */
+  child?(fields: LogFields): Logger;
+}
+
+/** A logger that folds `fields` under each line's own, delegating to `base`. */
+function mergingLogger(base: Logger, fields: LogFields): Logger {
+  return {
+    log(level: LogLevel, msg: string, line?: LogFields): void {
+      base.log(level, msg, { ...fields, ...line });
+    },
+  };
+}
+
+/**
+ * Scope `logger` to `fields`. Uses the sink's own `child()` when it has one
+ * (cheaper, and it keeps the sink's real context), otherwise wraps it in a
+ * merging logger, so this works with any injected `Logger`.
+ */
+export function childLogger(logger: Logger, fields: LogFields): Logger {
+  return logger.child ? logger.child(fields) : mergingLogger(logger, fields);
 }
 
 /** Emits one JSON object per line — friendly to log shippers and grep alike. */
@@ -24,13 +54,31 @@ export const consoleLogger: Logger = {
     else if (level === "debug") (console.debug ?? console.log)(line);
     else console.log(line);
   },
+  child(fields) {
+    // A fresh sink per scope rather than a recursion back into `childLogger`.
+    return mergingLogger(consoleLogger, fields);
+  },
 };
 
 /** Drops everything. The default, so tests and libraries stay quiet. */
-export const silentLogger: Logger = { log() {} };
+export const silentLogger: Logger = {
+  log() {},
+  child() {
+    return silentLogger;
+  },
+};
+
+/**
+ * Per-request context the engine stamps on everything a run produces. Kept as a
+ * type (not an interface) so it spreads cleanly into `LogFields`.
+ */
+export type RequestScope = {
+  readonly requestId?: string;
+  readonly traceparent?: string;
+};
 
 /** One immutable record of a single state transition. */
-export interface AuditEntry {
+export interface AuditEntry extends LogFields {
   readonly idempotencyKey: string;
   readonly corridorId: string;
   readonly from: CorridorState;
@@ -38,19 +86,114 @@ export interface AuditEntry {
   readonly version: number;
   readonly at: number;
   readonly error?: string;
+  /** Request id the run was started under, when the caller supplied one. */
+  readonly requestId?: string;
+  /** W3C `traceparent` of the request that started the run, when it had one. */
+  readonly traceparent?: string;
   readonly routeTrust?: "attested" | "manifest";
+  /** The anchor's SEP-38 fee, in the sell asset. Present on the `settled` entry when the quote carried one. */
+  readonly quoteFee?: Money;
+  /** Stellar network fee charged for the settlement, in stroops (Horizon `fee_charged`). */
+  readonly networkFee?: string;
+  readonly amountRefunded?: string;
+  readonly amountFee?: string;
+  /** Pre-settle gate results, recorded on the `verifying` transition. */
+  readonly checks?: readonly CheckResult[];
+}
+
+/** Verification decision recorded before the engine claims an idempotency key. */
+export interface AuditDetail {
+  readonly event: "verifying";
+  readonly idempotencyKey: string;
+  readonly corridorId: string;
+  readonly at: number;
+  /** Request id the run was started under, when the caller supplied one. */
+  readonly requestId?: string;
+  /** W3C `traceparent` of the request that started the run, when it had one. */
+  readonly traceparent?: string;
+  readonly detail: {
+    readonly liveness: LivenessState;
+    readonly effectiveCap?: string;
+  };
 }
 
 export interface AuditSink {
   record(entry: AuditEntry): Promise<void> | void;
+  recordDetail?(detail: AuditDetail): Promise<void> | void;
+}
+
+/**
+ * An audit sink that stamps `scope` onto every entry and detail it records, so a
+ * whole run's trail can be tied back to the request that started it without
+ * every emit site repeating the field.
+ */
+export function scopedAuditSink(sink: AuditSink, scope: RequestScope): AuditSink {
+  return {
+    record: (entry) => sink.record({ ...scope, ...entry }),
+    ...(sink.recordDetail && {
+      recordDetail: (detail) => sink.recordDetail!({ ...scope, ...detail }),
+    }),
+  };
+}
+
+export type AlertKind = "held" | "refund_pending" | "breaker_tripped";
+
+export interface Alert {
+  readonly kind: AlertKind;
+  readonly corridorId: string;
+  readonly idempotencyKey?: string;
+  readonly stellarTxHash?: string;
+  readonly lastError?: string;
+  readonly at: number;
+}
+
+/** Notifications are best-effort: an alert sink must never control payment state. */
+export interface Alerting {
+  raise(alert: Alert): Promise<void> | void;
+}
+
+export const noopAlerting: Alerting = { raise() {} };
+
+/** Small test sink; production deployments should inject an alert transport. */
+export class InMemoryAlerting implements Alerting {
+  readonly alerts: Alert[] = [];
+  raise(alert: Alert): void {
+    this.alerts.push({ ...alert });
+  }
+}
+
+/** Webhook transport sends only operational identifiers and never payment PII. */
+export class WebhookAlerting implements Alerting {
+  constructor(
+    private readonly url: string,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && parsed.hostname !== "localhost") {
+      throw new Error("WebhookAlerting requires HTTPS (localhost is allowed for development)");
+    }
+  }
+
+  async raise(alert: Alert): Promise<void> {
+    const response = await this.fetchImpl(this.url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(alert),
+    });
+    if (!response.ok) throw new Error(`alert webhook returned HTTP ${response.status}`);
+  }
 }
 
 /** In-memory audit log for tests/examples. Back this with an append-only table
  *  (or event stream) in production — never update or delete entries. */
 export class InMemoryAuditLog implements AuditSink {
   readonly entries: AuditEntry[] = [];
+  readonly details: AuditDetail[] = [];
   record(entry: AuditEntry): void {
     this.entries.push(entry);
+  }
+  recordDetail(detail: AuditDetail): void {
+    this.details.push(detail);
   }
 }
 

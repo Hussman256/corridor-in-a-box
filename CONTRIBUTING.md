@@ -30,11 +30,84 @@ pnpm example             # run a payment end-to-end (mocked anchor + settle)
 ```
 
 Node 22+ and pnpm 9+ are required (see `.nvmrc` and `packageManager` in
-`package.json`).
+`package.json`), and the contracts need a Rust toolchain with the
+`wasm32v1-none` target. The dev container below sets all of it up for you.
+
+The commands CI runs are also collected in the [`justfile`](./justfile), so you
+do not have to read `.github/workflows/ci.yml` to find them. `just --list` shows
+every recipe; `just ci` runs the whole gate.
+
+```bash
+cargo install just       # or brew install just, or https://github.com/casey/just#installation
+just install             # both pnpm roots: the monorepo and web/
+just check               # lint, typecheck, test
+just contracts           # cargo fmt --check, clippy -D warnings, test, wasm build
+just ci                  # all of the above, plus web and the Postgres test
+```
+
+### Dev container
+
+`.devcontainer/` captures that toolchain as code, for a fresh machine or a
+GitHub Codespace:
+
+- Node 22 (the `engines` floor) from the TypeScript devcontainer image, with
+  pnpm resolved through corepack from `packageManager` (`pnpm@9.12.0`)
+- Rust stable with `rustfmt`, `clippy` and the `wasm32v1-none` target — the same
+  toolchain CI's `contracts` job installs
+- a `postgres:16` service with `CORRIDOR_TEST_DATABASE_URL` already pointing at
+  it, so the Postgres-backed tests need no database setup of their own (the
+  crash-resume Postgres cases still need the live-anchor variables, as on a bare
+  machine)
+- `git`, so the `prepare` script can install lefthook's hooks
+
+Open it with **Reopen in Container** in VS Code (Dev Containers extension) or
+**Code → Codespaces → Create codespace** on GitHub. It installs both pnpm roots
+on create, after which these run as-is:
+
+```bash
+pnpm typecheck
+pnpm test            # also runs the Postgres suite, since the DB is configured
+pnpm exec vitest run tests/integration/idempotency-pg.test.ts
+cd contracts && cargo test
+```
+
+The reference-anchor stack is the one thing that does not work here:
+`scripts/reference-anchor.sh` drives rootless **podman** on the host, and a dev
+container has no nested container runtime. Docker-in-Docker would not help — it
+provides docker, while the script and `just anchor-up` call podman. `just` and
+`gitleaks` are not installed either, so the `justfile` stays the host workflow;
+`just pg-test` is redundant in here in any case, since it starts its own
+Postgres on 5432 while `CORRIDOR_TEST_DATABASE_URL` already points at the `db`
+service. Run `pnpm` and `cargo` directly in the container, and `just ci` /
+`just anchor-up` on the host.
+
+## Git hooks
+
+`pnpm install` runs a `prepare` script that installs [lefthook](https://github.com/evilmartians/lefthook)
+git hooks. On commit, staged files are checked quickly (< 5 s typical):
+
+- `prettier --write` on staged files
+- `eslint` on staged `.ts` files
+- `gitleaks git --staged` (with `.gitleaks.toml`) if `gitleaks` is installed
+  (skipped with a warning otherwise)
+- `rustfmt` on staged `contracts/**/*.rs` files
+
+To opt out for a single command, prefix it with `LEFTHOOK=0`, e.g.
+`LEFTHOOK=0 git commit -m "wip"`. Hooks are a convenience; CI still runs the
+full gate.
 
 ## Before you open a PR
 
-Run the full gate locally — CI runs the same three commands:
+Run the full gate locally. `just ci` runs the same steps as CI's build,
+contracts, web and integration-postgres jobs; CI also has a gitleaks job, whose
+local equivalent is `just secret-scan`. `just ci` needs a container runtime for
+the Postgres job — without one, run `just check && just contracts && just web`.
+
+```bash
+just ci
+```
+
+Or, without `just`, the three commands the monorepo gate is made of:
 
 ```bash
 pnpm lint && pnpm typecheck && pnpm test
@@ -77,14 +150,10 @@ under ~72 characters and explain the _why_ in the body.
 
 ## Good first issues
 
-- Add a `*.corridor.yaml` for a live SEP-31 receive-side anchor (fill `dest.endpoints`
-  from its `stellar.toml`) and a `plan` test asserting it reports runnable.
-- Extend the conformance suite in `packages/adapter-kit` with more probes.
-- Run the env-gated integration test against the Anchor Platform reference server
-  and capture the trail in the README (see `tests/integration/` and
-  [docs/operations.md](./docs/operations.md)).
-- Widen the SEP-31 status mapping in `packages/sep31` as you hit real anchors that
-  report statuses we don't yet classify (see `mapSep31Status`).
+- Add `*.corridor.yaml` manifests for live SEP-24 / SEP-6 anchors and add corresponding `plan` verification tests.
+- Extend the conformance suite in `packages/adapter-kit` with additional probes for anchor SEP conformance.
+- Add and expand conformance and integration test coverage across corridor lifecycle states and error paths.
+- Widen the SEP-31 status mapping in `packages/sep31` as you hit real anchors that report statuses we don't yet classify (see `mapSep31Status`).
 
 ## Keeping docs in sync
 

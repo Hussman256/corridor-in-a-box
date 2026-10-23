@@ -3,31 +3,38 @@
 // a monotonic version after each transition so a crashed run can be resumed and
 // reconciled rather than lost.
 
-export type CorridorState =
-  | "created"
-  | "quoted"
-  | "compliant"
-  | "opened"
-  | "settling"
-  | "retrying"
-  | "settled"
-  | "reconciled"
-  | "completed"
-  | "recovering"
-  | "refund_pending"
-  | "refunded"
-  | "held"
-  | "failed";
+// Every state, as a runtime array the type is derived from, so tooling that
+// needs the list (scripts/gen-web-data.ts) reads it instead of copying it.
+export const ALL_STATES = [
+  "created",
+  "quoted",
+  "compliant",
+  "opened",
+  "verifying",
+  "settling",
+  "retrying",
+  "settled",
+  "reconciled",
+  "completed",
+  "recovering",
+  "refund_pending",
+  "refunded",
+  "held",
+  "failed",
+] as const;
+
+export type CorridorState = (typeof ALL_STATES)[number];
 
 const NEXT: Record<CorridorState, readonly CorridorState[]> = {
   created: ["quoted", "failed"],
   quoted: ["compliant", "recovering", "failed"],
   compliant: ["opened", "recovering", "failed"],
-  opened: ["settling", "recovering", "failed"],
+  opened: ["verifying", "recovering", "failed"],
+  verifying: ["settling", "failed"],
   settling: ["settled", "retrying", "recovering", "failed"],
   // A settle attempt failed BEFORE money moved, so going round again is safe.
-  // This is the only state that may re-enter `settling`.
-  retrying: ["settling", "recovering", "failed"],
+  // This is the only state that may re-enter `verifying`.
+  retrying: ["verifying", "recovering", "failed"],
   settled: ["reconciled", "recovering", "failed"],
   reconciled: ["completed", "failed"],
   completed: [],
