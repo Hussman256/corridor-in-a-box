@@ -57,7 +57,6 @@ const REQUIRED_DEST_ENDPOINT: Record<string, string> = {
   sep6: "transfer_server",
 };
 
-// TODO: https://github.com/ezedike-evan/corridor-in-a-box/issues/212 — align web/lib/corridors.ts with protocol-aware liveness.
 export function liveness(c: Corridor, now: Date = new Date()): Liveness {
   const warnings: string[] = [];
   const gaps: string[] = [];
